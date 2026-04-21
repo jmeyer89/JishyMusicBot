@@ -13,6 +13,8 @@ FFmpeg. All commands are Discord-native slash commands.
 | `/resume` | Resume paused playback |
 | `/stop` | Stop playback and clear the queue |
 | `/queue` | Show the current queue |
+| `/shuffle` | Randomize the order of the queue |
+| `/remove <position>` | Remove a song from the queue by its position |
 | `/nowplaying` | Show the currently playing song |
 | `/volume <0-100>` | Set playback volume |
 | `/leave` | Disconnect the bot from voice |
@@ -71,3 +73,33 @@ On first startup the bot syncs its slash command tree with Discord. Global
 sync can take up to an hour to propagate; if you want your commands to appear
 instantly in a single test server, swap `await bot.tree.sync()` for
 `await bot.tree.sync(guild=discord.Object(id=YOUR_GUILD_ID))`.
+
+## How it works (plain English)
+
+When you type `/play some song` in a Discord server:
+
+1. The bot joins your voice channel.
+2. It searches YouTube for what you typed.
+3. It grabs the audio from the top result and plays it in the voice channel.
+
+If a song is already playing, your new one gets added to a **queue** — a
+waiting list. When the current song ends, the next one in the queue plays
+automatically. When the queue is empty, the bot just sits quietly in the
+voice channel until someone adds more songs or uses `/leave`.
+
+Each Discord server has its own separate queue, so if the bot is in two
+servers at once, they don't interfere with each other.
+
+The bot doesn't save anything to a file or database. If you restart the bot,
+the queue is empty and it forgets what was playing. That's on purpose — it
+keeps things simple.
+
+### The two tools doing the real work
+
+- **yt-dlp** — knows how to talk to YouTube and find the audio for a video.
+- **FFmpeg** — takes that audio and streams it into Discord.
+
+Both of these run behind the scenes. You don't use them directly, but
+FFmpeg has to be installed on your computer (that's what section 1 above
+is for). yt-dlp is a Python package that gets installed automatically when
+you run `pip install -r requirements.txt`.

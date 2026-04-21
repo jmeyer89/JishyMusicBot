@@ -1,5 +1,6 @@
 import os
 import asyncio
+import random
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -8,6 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+TEST_GUILD_ID = 205409317283823627
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -80,8 +82,10 @@ async def _advance_and_announce(guild_id: int, voice_client: discord.VoiceClient
 @bot.event
 async def on_ready() -> None:
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s).")
+        guild = discord.Object(id=TEST_GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        print(f"Synced {len(synced)} slash command(s) to test guild.")
     except Exception as sync_error:
         print(f"Failed to sync command tree: {sync_error}")
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
@@ -173,6 +177,34 @@ async def queue_command(interaction: discord.Interaction) -> None:
     for index, song in enumerate(pending_songs, start=1):
         lines.append(f"`{index}.` {song['title']} — requested by {song.get('requester', 'unknown')}")
     await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(name="shuffle", description="Shuffle the current queue.")
+async def shuffle(interaction: discord.Interaction) -> None:
+    guild_id = interaction.guild.id
+    queue = song_queues.get(guild_id, [])
+    if len(queue) < 2:
+        await interaction.response.send_message("Not enough songs in the queue to shuffle.", ephemeral=True)
+        return
+    random.shuffle(queue)
+    await interaction.response.send_message(f"Shuffled {len(queue)} songs.")
+
+
+@bot.tree.command(name="remove", description="Remove a song from the queue by its position.")
+@app_commands.describe(position="Queue position to remove (see /queue)")
+async def remove(interaction: discord.Interaction, position: int) -> None:
+    guild_id = interaction.guild.id
+    queue = song_queues.get(guild_id, [])
+    if not queue:
+        await interaction.response.send_message("The queue is empty.", ephemeral=True)
+        return
+    if position < 1 or position > len(queue):
+        await interaction.response.send_message(
+            f"Position must be between 1 and {len(queue)}.", ephemeral=True
+        )
+        return
+    removed = queue.pop(position - 1)
+    await interaction.response.send_message(f"Removed **{removed['title']}** from the queue.")
 
 
 @bot.tree.command(name="nowplaying", description="Show the currently playing song.")
