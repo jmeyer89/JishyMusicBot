@@ -38,7 +38,6 @@ ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
 
 
 async def extract_song_info(query: str) -> dict:
-    """Run the blocking yt-dlp extraction in a thread and return a song dict."""
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
     if "entries" in data:
@@ -52,7 +51,6 @@ async def extract_song_info(query: str) -> dict:
 
 
 def play_next(guild_id: int, voice_client: discord.VoiceClient) -> None:
-    """Advance the per-guild queue and start the next song if one exists."""
     queue = song_queues.get(guild_id, [])
     if not queue:
         currently_playing.pop(guild_id, None)
@@ -69,7 +67,6 @@ def play_next(guild_id: int, voice_client: discord.VoiceClient) -> None:
 
 
 async def _advance_and_announce(guild_id: int, voice_client: discord.VoiceClient) -> None:
-    """Coroutine wrapper around play_next that also announces the next track in the text channel."""
     play_next(guild_id, voice_client)
     now = currently_playing.get(guild_id)
     channel = announce_channels.get(guild_id)
@@ -82,7 +79,6 @@ async def _advance_and_announce(guild_id: int, voice_client: discord.VoiceClient
 
 @bot.event
 async def on_ready() -> None:
-    """Fires once when the bot connects — sync the slash command tree with Discord."""
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s).")
@@ -94,7 +90,6 @@ async def on_ready() -> None:
 @bot.tree.command(name="play", description="Search YouTube and play or queue a song.")
 @app_commands.describe(query="A YouTube URL or a search term")
 async def play(interaction: discord.Interaction, query: str) -> None:
-    """/play — join the caller's voice channel and play/queue the requested track."""
     await interaction.response.defer()
     user_voice_state = interaction.user.voice
     if user_voice_state is None or user_voice_state.channel is None:
@@ -125,7 +120,6 @@ async def play(interaction: discord.Interaction, query: str) -> None:
 
 @bot.tree.command(name="skip", description="Skip the current song.")
 async def skip(interaction: discord.Interaction) -> None:
-    """/skip — stop the current track so the after-callback advances the queue."""
     voice_client = interaction.guild.voice_client
     if voice_client is None or not voice_client.is_playing():
         await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
@@ -136,7 +130,6 @@ async def skip(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="pause", description="Pause playback.")
 async def pause(interaction: discord.Interaction) -> None:
-    """/pause — freeze the current track in place."""
     voice_client = interaction.guild.voice_client
     if voice_client is None or not voice_client.is_playing():
         await interaction.response.send_message("Nothing is playing to pause.", ephemeral=True)
@@ -147,7 +140,6 @@ async def pause(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="resume", description="Resume paused playback.")
 async def resume(interaction: discord.Interaction) -> None:
-    """/resume — continue a previously paused track."""
     voice_client = interaction.guild.voice_client
     if voice_client is None or not voice_client.is_paused():
         await interaction.response.send_message("Nothing is paused.", ephemeral=True)
@@ -158,7 +150,6 @@ async def resume(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="stop", description="Stop playback and clear the queue.")
 async def stop(interaction: discord.Interaction) -> None:
-    """/stop — wipe the queue and halt whatever is currently playing."""
     guild_id = interaction.guild.id
     song_queues[guild_id] = []
     currently_playing.pop(guild_id, None)
@@ -170,7 +161,6 @@ async def stop(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="queue", description="Show the current song queue.")
 async def queue_command(interaction: discord.Interaction) -> None:
-    """/queue — print the upcoming songs in order."""
     guild_id = interaction.guild.id
     pending_songs = song_queues.get(guild_id, [])
     now_playing_song = currently_playing.get(guild_id)
@@ -187,7 +177,6 @@ async def queue_command(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="nowplaying", description="Show the currently playing song.")
 async def nowplaying(interaction: discord.Interaction) -> None:
-    """/nowplaying — report the track currently on the voice client."""
     guild_id = interaction.guild.id
     now_playing_song = currently_playing.get(guild_id)
     if now_playing_song is None:
@@ -201,7 +190,6 @@ async def nowplaying(interaction: discord.Interaction) -> None:
 @bot.tree.command(name="volume", description="Set playback volume (0-100).")
 @app_commands.describe(level="Volume level from 0 to 100")
 async def volume(interaction: discord.Interaction, level: int) -> None:
-    """/volume — scale the PCMVolumeTransformer on the active source."""
     if level < 0 or level > 100:
         await interaction.response.send_message("Volume must be between 0 and 100.", ephemeral=True)
         return
@@ -215,7 +203,6 @@ async def volume(interaction: discord.Interaction, level: int) -> None:
 
 @bot.tree.command(name="leave", description="Disconnect the bot from voice.")
 async def leave(interaction: discord.Interaction) -> None:
-    """/leave — disconnect cleanly and clear per-guild state."""
     voice_client = interaction.guild.voice_client
     if voice_client is None:
         await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
