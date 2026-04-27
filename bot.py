@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-TEST_GUILD_ID = 205409317283823627
+INSTANT_SYNC_GUILD_IDS = [205409317283823627, 708832660444938244]
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -29,6 +29,7 @@ YTDL_FORMAT_OPTIONS = {
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "skip_download": True,
+    "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
 }
 
 FFMPEG_OPTIONS = {
@@ -82,10 +83,14 @@ async def _advance_and_announce(guild_id: int, voice_client: discord.VoiceClient
 @bot.event
 async def on_ready() -> None:
     try:
-        guild = discord.Object(id=TEST_GUILD_ID)
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        print(f"Synced {len(synced)} slash command(s) to test guild.")
+        for guild_id in INSTANT_SYNC_GUILD_IDS:
+            guild = discord.Object(id=guild_id)
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(synced)} slash command(s) to guild {guild_id}.")
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
+        print("Cleared global commands.")
     except Exception as sync_error:
         print(f"Failed to sync command tree: {sync_error}")
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
@@ -190,9 +195,9 @@ async def shuffle(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(f"Shuffled {len(queue)} songs.")
 
 
-@bot.tree.command(name="remove", description="Remove a song from the queue by its position.")
+@bot.tree.command(name="qremove", description="Remove a song from the queue by its position.")
 @app_commands.describe(position="Queue position to remove (see /queue)")
-async def remove(interaction: discord.Interaction, position: int) -> None:
+async def qremove(interaction: discord.Interaction, position: int) -> None:
     guild_id = interaction.guild.id
     queue = song_queues.get(guild_id, [])
     if not queue:
@@ -205,6 +210,29 @@ async def remove(interaction: discord.Interaction, position: int) -> None:
         return
     removed = queue.pop(position - 1)
     await interaction.response.send_message(f"Removed **{removed['title']}** from the queue.")
+
+
+@bot.tree.command(name="playnext", description="Move a queued song to the top of the queue.")
+@app_commands.describe(position="Queue position to move to the top (see /queue)")
+async def playnext(interaction: discord.Interaction, position: int) -> None:
+    guild_id = interaction.guild.id
+    queue = song_queues.get(guild_id, [])
+    if not queue:
+        await interaction.response.send_message("The queue is empty.", ephemeral=True)
+        return
+    if position < 1 or position > len(queue):
+        await interaction.response.send_message(
+            f"Position must be between 1 and {len(queue)}.", ephemeral=True
+        )
+        return
+    if position == 1:
+        await interaction.response.send_message(
+            f"**{queue[0]['title']}** is already next.", ephemeral=True
+        )
+        return
+    song = queue.pop(position - 1)
+    queue.insert(0, song)
+    await interaction.response.send_message(f"Moved **{song['title']}** to the top of the queue.")
 
 
 @bot.tree.command(name="nowplaying", description="Show the currently playing song.")
