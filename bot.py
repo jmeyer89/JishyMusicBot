@@ -1,6 +1,7 @@
 import os
 import asyncio
 import random
+import time
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -20,8 +21,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 song_queues: dict[int, list[dict]] = {}
 currently_playing: dict[int, dict] = {}
 announce_channels: dict[int, discord.abc.Messageable] = {}
+now_playing_tasks: dict[int, asyncio.Task] = {}
+now_playing_messages: dict[int, discord.Message] = {}
 
 MAX_QUEUE_LENGTH = 30
+NOW_PLAYING_REFRESH_SECONDS = 1
 
 YTDL_FORMAT_OPTIONS = {
     "format": "bestaudio/best",
@@ -61,6 +65,9 @@ def play_next(guild_id: int, voice_client: discord.VoiceClient) -> None:
         currently_playing.pop(guild_id, None)
         return
     next_song = queue.pop(0)
+    next_song["started_at"] = time.monotonic()
+    next_song["paused_total"] = 0.0
+    next_song["paused_at"] = None
     currently_playing[guild_id] = next_song
     source = discord.FFmpegPCMAudio(next_song["url"], **FFMPEG_OPTIONS)
     source = discord.PCMVolumeTransformer(source, volume=1.0)
@@ -74,12 +81,80 @@ def play_next(guild_id: int, voice_client: discord.VoiceClient) -> None:
 async def _advance_and_announce(guild_id: int, voice_client: discord.VoiceClient) -> None:
     play_next(guild_id, voice_client)
     now = currently_playing.get(guild_id)
-    channel = announce_channels.get(guild_id)
-    if now and channel:
+    if not now:
+        return
+    panel = now_playing_messages.get(guild_id)
+    if panel is not None:
         try:
-            await channel.send(f"Now playing: **{now['title']}**")
+            await panel.edit(content=_format_now_playing(now), view=QueueControlsView())
+            _start_now_playing_ticker(guild_id, now, panel)
+            return
         except discord.DiscordException:
-            pass
+            now_playing_messages.pop(guild_id, None)
+    channel = announce_channels.get(guild_id)
+    if channel is None:
+        return
+    try:
+        sent = await channel.send(_format_now_playing(now), view=QueueControlsView())
+    except discord.DiscordException:
+        return
+    now_playing_messages[guild_id] = sent
+    _start_now_playing_ticker(guild_id, now, sent)
+
+
+def _format_time(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    if minutes >= 60:
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _elapsed_seconds(song: dict) -> float:
+    started_at = song.get("started_at")
+    if started_at is None:
+        return 0.0
+    paused_total = song.get("paused_total", 0.0)
+    paused_at = song.get("paused_at")
+    reference = paused_at if paused_at is not None else time.monotonic()
+    return reference - started_at - paused_total
+
+
+def _format_now_playing(song: dict) -> str:
+    elapsed = _elapsed_seconds(song)
+    duration = song.get("duration")
+    if duration:
+        time_str = f" `[{_format_time(elapsed)} / {_format_time(duration)}]`"
+    else:
+        time_str = f" `[{_format_time(elapsed)}]`"
+    return f"**Now playing:** {song['title']}{time_str}"
+
+
+async def _tick_now_playing(guild_id: int, song: dict, message) -> None:
+    last_content: str | None = None
+    try:
+        while True:
+            await asyncio.sleep(NOW_PLAYING_REFRESH_SECONDS)
+            if currently_playing.get(guild_id) is not song:
+                return
+            content = _format_now_playing(song)
+            if content == last_content:
+                continue
+            try:
+                await message.edit(content=content)
+                last_content = content
+            except discord.DiscordException:
+                return
+    except asyncio.CancelledError:
+        return
+
+
+def _start_now_playing_ticker(guild_id: int, song: dict, message) -> None:
+    existing = now_playing_tasks.get(guild_id)
+    if existing is not None and not existing.done():
+        existing.cancel()
+    now_playing_tasks[guild_id] = asyncio.create_task(_tick_now_playing(guild_id, song, message))
 
 
 def _format_queue_lines(guild_id: int) -> list[str]:
@@ -87,7 +162,7 @@ def _format_queue_lines(guild_id: int) -> list[str]:
     now_playing_song = currently_playing.get(guild_id)
     lines: list[str] = []
     if now_playing_song:
-        lines.append(f"**Now playing:** {now_playing_song['title']}")
+        lines.append(_format_now_playing(now_playing_song))
     for index, song in enumerate(pending_songs, start=1):
         lines.append(f"`{index}.` {song['title']} — requested by {song.get('requester', 'unknown')}")
     return lines
@@ -113,13 +188,11 @@ class PlayPositionModal(discord.ui.Modal, title="Enter queue number"):
             )
             return
         if position_value == 1:
-            await interaction.response.send_message(
-                f"**{queue[0]['title']}** is already next.", ephemeral=True
-            )
+            await interaction.response.defer()
             return
         song = queue.pop(position_value - 1)
         queue.insert(0, song)
-        await interaction.response.send_message(f"Moved **{song['title']}** to the top of the queue.")
+        await interaction.response.defer()
 
 
 class QueueControlsView(discord.ui.View):
@@ -134,11 +207,18 @@ class QueueControlsView(discord.ui.View):
             return
         if voice_client.is_playing():
             voice_client.pause()
-            await interaction.response.send_message("Paused.")
+            song = currently_playing.get(interaction.guild.id)
+            if song is not None and song.get("paused_at") is None:
+                song["paused_at"] = time.monotonic()
+            await interaction.response.defer()
             return
         if voice_client.is_paused():
             voice_client.resume()
-            await interaction.response.send_message("Resumed.")
+            song = currently_playing.get(interaction.guild.id)
+            if song is not None and song.get("paused_at") is not None:
+                song["paused_total"] = song.get("paused_total", 0.0) + (time.monotonic() - song["paused_at"])
+                song["paused_at"] = None
+            await interaction.response.defer()
             return
         await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
 
@@ -149,7 +229,7 @@ class QueueControlsView(discord.ui.View):
             await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
             return
         voice_client.stop()
-        await interaction.response.send_message("Skipped.")
+        await interaction.response.defer()
 
     @discord.ui.button(label="Show Queue", style=discord.ButtonStyle.secondary)
     async def show_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -212,15 +292,17 @@ async def play(interaction: discord.Interaction, query: str) -> None:
     announce_channels[guild_id] = interaction.channel
     if not voice_client.is_playing() and not voice_client.is_paused():
         play_next(guild_id, voice_client)
-        await interaction.followup.send(
-            f"Now playing: **{song['title']}**", view=QueueControlsView()
+        sent = await interaction.followup.send(
+            _format_now_playing(song), view=QueueControlsView()
         )
+        now_playing_messages[guild_id] = sent
+        _start_now_playing_ticker(guild_id, song, sent)
     else:
         position_in_queue = len(song_queues[guild_id])
         now_playing_song = currently_playing.get(guild_id)
         message = f"Queued **{song['title']}** at position {position_in_queue}."
         if now_playing_song:
-            message += f"\nCurrently playing: **{now_playing_song['title']}**"
+            message += f"\n{_format_now_playing(now_playing_song)}"
         await interaction.followup.send(message, view=QueueControlsView())
 
 
@@ -241,6 +323,9 @@ async def pause(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Nothing is playing to pause.", ephemeral=True)
         return
     voice_client.pause()
+    song = currently_playing.get(interaction.guild.id)
+    if song is not None and song.get("paused_at") is None:
+        song["paused_at"] = time.monotonic()
     await interaction.response.send_message("Paused.")
 
 
@@ -251,6 +336,10 @@ async def resume(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Nothing is paused.", ephemeral=True)
         return
     voice_client.resume()
+    song = currently_playing.get(interaction.guild.id)
+    if song is not None and song.get("paused_at") is not None:
+        song["paused_total"] = song.get("paused_total", 0.0) + (time.monotonic() - song["paused_at"])
+        song["paused_at"] = None
     await interaction.response.send_message("Resumed.")
 
 
@@ -259,6 +348,7 @@ async def stop(interaction: discord.Interaction) -> None:
     guild_id = interaction.guild.id
     song_queues[guild_id] = []
     currently_playing.pop(guild_id, None)
+    now_playing_messages.pop(guild_id, None)
     voice_client = interaction.guild.voice_client
     if voice_client is not None and (voice_client.is_playing() or voice_client.is_paused()):
         voice_client.stop()
@@ -333,7 +423,7 @@ async def nowplaying(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
         return
     await interaction.response.send_message(
-        f"Now playing: **{now_playing_song['title']}**\n{now_playing_song.get('webpage_url', '')}"
+        f"{_format_now_playing(now_playing_song)}\n{now_playing_song.get('webpage_url', '')}"
     )
 
 
@@ -361,6 +451,7 @@ async def leave(interaction: discord.Interaction) -> None:
     song_queues.pop(guild_id, None)
     currently_playing.pop(guild_id, None)
     announce_channels.pop(guild_id, None)
+    now_playing_messages.pop(guild_id, None)
     await voice_client.disconnect()
     await interaction.response.send_message("Disconnected.")
 
