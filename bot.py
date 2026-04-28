@@ -21,6 +21,8 @@ song_queues: dict[int, list[dict]] = {}
 currently_playing: dict[int, dict] = {}
 announce_channels: dict[int, discord.abc.Messageable] = {}
 
+MAX_QUEUE_LENGTH = 30
+
 YTDL_FORMAT_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": True,
@@ -80,6 +82,88 @@ async def _advance_and_announce(guild_id: int, voice_client: discord.VoiceClient
             pass
 
 
+def _format_queue_lines(guild_id: int) -> list[str]:
+    pending_songs = song_queues.get(guild_id, [])
+    now_playing_song = currently_playing.get(guild_id)
+    lines: list[str] = []
+    if now_playing_song:
+        lines.append(f"**Now playing:** {now_playing_song['title']}")
+    for index, song in enumerate(pending_songs, start=1):
+        lines.append(f"`{index}.` {song['title']} — requested by {song.get('requester', 'unknown')}")
+    return lines
+
+
+class PlayPositionModal(discord.ui.Modal, title="Enter queue number"):
+    position = discord.ui.TextInput(label="Enter queue number", placeholder="e.g. 3", required=True, max_length=3)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            position_value = int(self.position.value)
+        except ValueError:
+            await interaction.response.send_message("Position must be a number.", ephemeral=True)
+            return
+        guild_id = interaction.guild.id
+        queue = song_queues.get(guild_id, [])
+        if not queue:
+            await interaction.response.send_message("The queue is empty.", ephemeral=True)
+            return
+        if position_value < 1 or position_value > len(queue):
+            await interaction.response.send_message(
+                f"Position must be between 1 and {len(queue)}.", ephemeral=True
+            )
+            return
+        if position_value == 1:
+            await interaction.response.send_message(
+                f"**{queue[0]['title']}** is already next.", ephemeral=True
+            )
+            return
+        song = queue.pop(position_value - 1)
+        queue.insert(0, song)
+        await interaction.response.send_message(f"Moved **{song['title']}** to the top of the queue.")
+
+
+class QueueControlsView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=600)
+
+    @discord.ui.button(label="Pause/Play", style=discord.ButtonStyle.success)
+    async def pause_play_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        voice_client = interaction.guild.voice_client
+        if voice_client is None:
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+            return
+        if voice_client.is_playing():
+            voice_client.pause()
+            await interaction.response.send_message("Paused.")
+            return
+        if voice_client.is_paused():
+            voice_client.resume()
+            await interaction.response.send_message("Resumed.")
+            return
+        await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.danger)
+    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        voice_client = interaction.guild.voice_client
+        if voice_client is None or not voice_client.is_playing():
+            await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+            return
+        voice_client.stop()
+        await interaction.response.send_message("Skipped.")
+
+    @discord.ui.button(label="Show Queue", style=discord.ButtonStyle.secondary)
+    async def show_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        lines = _format_queue_lines(interaction.guild.id)
+        if not lines:
+            await interaction.response.send_message("The queue is empty.", ephemeral=True)
+            return
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="Play #", style=discord.ButtonStyle.primary)
+    async def play_position(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(PlayPositionModal())
+
+
 @bot.event
 async def on_ready() -> None:
     try:
@@ -105,6 +189,14 @@ async def play(interaction: discord.Interaction, query: str) -> None:
         await interaction.followup.send("You need to be in a voice channel first.", ephemeral=True)
         return
     target_channel = user_voice_state.channel
+    guild_id = interaction.guild.id
+    current_queue_length = len(song_queues.get(guild_id, []))
+    if current_queue_length >= MAX_QUEUE_LENGTH:
+        await interaction.followup.send(
+            f"The queue is full ({MAX_QUEUE_LENGTH} songs max). Wait for some to finish or use /stop to clear it.",
+            ephemeral=True,
+        )
+        return
     voice_client = interaction.guild.voice_client
     if voice_client is None:
         voice_client = await target_channel.connect()
@@ -116,15 +208,20 @@ async def play(interaction: discord.Interaction, query: str) -> None:
         await interaction.followup.send(f"Could not fetch that song: {extraction_error}")
         return
     song["requester"] = interaction.user.display_name
-    guild_id = interaction.guild.id
     song_queues.setdefault(guild_id, []).append(song)
     announce_channels[guild_id] = interaction.channel
     if not voice_client.is_playing() and not voice_client.is_paused():
         play_next(guild_id, voice_client)
-        await interaction.followup.send(f"Now playing: **{song['title']}**")
+        await interaction.followup.send(
+            f"Now playing: **{song['title']}**", view=QueueControlsView()
+        )
     else:
         position_in_queue = len(song_queues[guild_id])
-        await interaction.followup.send(f"Queued **{song['title']}** at position {position_in_queue}.")
+        now_playing_song = currently_playing.get(guild_id)
+        message = f"Queued **{song['title']}** at position {position_in_queue}."
+        if now_playing_song:
+            message += f"\nCurrently playing: **{now_playing_song['title']}**"
+        await interaction.followup.send(message, view=QueueControlsView())
 
 
 @bot.tree.command(name="skip", description="Skip the current song.")
@@ -170,18 +267,11 @@ async def stop(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="queue", description="Show the current song queue.")
 async def queue_command(interaction: discord.Interaction) -> None:
-    guild_id = interaction.guild.id
-    pending_songs = song_queues.get(guild_id, [])
-    now_playing_song = currently_playing.get(guild_id)
-    if not pending_songs and not now_playing_song:
+    lines = _format_queue_lines(interaction.guild.id)
+    if not lines:
         await interaction.response.send_message("The queue is empty.", ephemeral=True)
         return
-    lines: list[str] = []
-    if now_playing_song:
-        lines.append(f"**Now playing:** {now_playing_song['title']}")
-    for index, song in enumerate(pending_songs, start=1):
-        lines.append(f"`{index}.` {song['title']} — requested by {song.get('requester', 'unknown')}")
-    await interaction.response.send_message("\n".join(lines))
+    await interaction.response.send_message("\n".join(lines), view=QueueControlsView())
 
 
 @bot.tree.command(name="shuffle", description="Shuffle the current queue.")
