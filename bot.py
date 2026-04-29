@@ -13,7 +13,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-INSTANT_SYNC_GUILD_IDS = [205409317283823627, 708832660444938244]
+
+
+def _parse_guild_ids(env_value: str | None) -> list[int]:
+    if not env_value:
+        return []
+    ids: list[int] = []
+    for part in env_value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            print(f"[config] ignoring invalid guild ID: {part}")
+    return ids
+
+
+INSTANT_SYNC_GUILD_IDS = _parse_guild_ids(os.getenv("INSTANT_SYNC_GUILD_IDS"))
 
 intents = discord.Intents.default()
 
@@ -662,14 +679,18 @@ class QueueControlsView(discord.ui.View):
 @bot.event
 async def on_ready() -> None:
     try:
-        for guild_id in INSTANT_SYNC_GUILD_IDS:
-            guild = discord.Object(id=guild_id)
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(synced)} slash command(s) to guild {guild_id}.")
-        bot.tree.clear_commands(guild=None)
-        await bot.tree.sync()
-        print("Cleared global commands.")
+        if INSTANT_SYNC_GUILD_IDS:
+            for guild_id in INSTANT_SYNC_GUILD_IDS:
+                guild = discord.Object(id=guild_id)
+                bot.tree.copy_global_to(guild=guild)
+                synced = await bot.tree.sync(guild=guild)
+                print(f"Synced {len(synced)} slash command(s) to guild {guild_id}.")
+            bot.tree.clear_commands(guild=None)
+            await bot.tree.sync()
+            print("Cleared global commands.")
+        else:
+            synced = await bot.tree.sync()
+            print(f"Synced {len(synced)} global slash command(s).")
     except Exception as sync_error:
         print(f"Failed to sync command tree: {sync_error}")
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
