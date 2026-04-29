@@ -13,8 +13,6 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 INSTANT_SYNC_GUILD_IDS = [205409317283823627, 708832660444938244]
 
 intents = discord.Intents.default()
-intents.message_content = True
-intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -23,9 +21,14 @@ currently_playing: dict[int, dict] = {}
 announce_channels: dict[int, discord.abc.Messageable] = {}
 now_playing_tasks: dict[int, asyncio.Task] = {}
 now_playing_messages: dict[int, discord.Message] = {}
+saved_queues: dict[int, list[dict]] = {}
 
 MAX_QUEUE_LENGTH = 30
 NOW_PLAYING_REFRESH_SECONDS = 1
+DEFAULT_VOLUME = 0.5
+
+queue_expanded: dict[int, bool] = {}
+volume_levels: dict[int, float] = {}
 
 YTDL_FORMAT_OPTIONS = {
     "format": "bestaudio/best",
@@ -38,12 +41,53 @@ YTDL_FORMAT_OPTIONS = {
     "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
 }
 
-FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
+def _ffmpeg_options(seek: float | None = None) -> dict:
+    before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+    if seek and seek > 0:
+        before = f"-ss {seek:.3f} {before}"
+    return {
+        "before_options": before,
+        "options": "-vn -af dynaudnorm",
+    }
 
 ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
+
+YTDL_PLAYLIST_OPTIONS = {
+    **YTDL_FORMAT_OPTIONS,
+    "noplaylist": False,
+    "extract_flat": "in_playlist",
+}
+ytdl_playlist = yt_dlp.YoutubeDL(YTDL_PLAYLIST_OPTIONS)
+
+
+def _is_playlist_url(query: str) -> bool:
+    return "playlist?list=" in query
+
+
+async def extract_playlist_info(query: str) -> list[dict]:
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(None, lambda: ytdl_playlist.extract_info(query, download=False))
+    entries = data.get("entries") or []
+    songs: list[dict] = []
+    for entry in entries:
+        if not entry:
+            continue
+        webpage_url = entry.get("url") or entry.get("webpage_url")
+        if not webpage_url:
+            video_id = entry.get("id")
+            if video_id:
+                webpage_url = f"https://www.youtube.com/watch?v={video_id}"
+        if not webpage_url:
+            continue
+        thumbs = entry.get("thumbnails") or []
+        songs.append({
+            "title": entry.get("title", "Unknown title"),
+            "url": None,
+            "webpage_url": webpage_url,
+            "duration": entry.get("duration"),
+            "thumbnail": entry.get("thumbnail") or (thumbs[-1].get("url") if thumbs else None),
+        })
+    return songs
 
 
 async def extract_song_info(query: str) -> dict:
@@ -56,21 +100,45 @@ async def extract_song_info(query: str) -> dict:
         "url": data["url"],
         "webpage_url": data.get("webpage_url", query),
         "duration": data.get("duration"),
+        "thumbnail": data.get("thumbnail"),
     }
 
 
-def play_next(guild_id: int, voice_client: discord.VoiceClient) -> None:
+async def play_next(guild_id: int, voice_client: discord.VoiceClient) -> None:
     queue = song_queues.get(guild_id, [])
     if not queue:
         currently_playing.pop(guild_id, None)
         return
     next_song = queue.pop(0)
-    next_song["started_at"] = time.monotonic()
+    if not next_song.get("url"):
+        source_query = next_song.get("webpage_url") or next_song.get("title")
+        if not source_query:
+            await play_next(guild_id, voice_client)
+            return
+        try:
+            fresh = await extract_song_info(source_query)
+        except Exception as extraction_error:
+            print(f"[player] could not refresh URL for {next_song.get('title', source_query)}: {extraction_error}")
+            await play_next(guild_id, voice_client)
+            return
+        next_song["url"] = fresh["url"]
+        if not next_song.get("title"):
+            next_song["title"] = fresh.get("title")
+        if not next_song.get("duration"):
+            next_song["duration"] = fresh.get("duration")
+        if not next_song.get("webpage_url"):
+            next_song["webpage_url"] = fresh.get("webpage_url")
+        if not next_song.get("thumbnail"):
+            next_song["thumbnail"] = fresh.get("thumbnail")
+    if not voice_client.is_connected():
+        return
+    seek_to = float(next_song.pop("seek_to", 0.0) or 0.0)
+    next_song["started_at"] = time.monotonic() - seek_to
     next_song["paused_total"] = 0.0
     next_song["paused_at"] = None
     currently_playing[guild_id] = next_song
-    source = discord.FFmpegPCMAudio(next_song["url"], **FFMPEG_OPTIONS)
-    source = discord.PCMVolumeTransformer(source, volume=1.0)
+    source = discord.FFmpegPCMAudio(next_song["url"], **_ffmpeg_options(seek_to))
+    source = discord.PCMVolumeTransformer(source, volume=volume_levels.get(guild_id, DEFAULT_VOLUME))
     def after_playing(error: Exception | None) -> None:
         if error:
             print(f"[player] error during playback in guild {guild_id}: {error}")
@@ -79,14 +147,14 @@ def play_next(guild_id: int, voice_client: discord.VoiceClient) -> None:
 
 
 async def _advance_and_announce(guild_id: int, voice_client: discord.VoiceClient) -> None:
-    play_next(guild_id, voice_client)
+    await play_next(guild_id, voice_client)
     now = currently_playing.get(guild_id)
     if not now:
         return
     panel = now_playing_messages.get(guild_id)
     if panel is not None:
         try:
-            await panel.edit(content=_format_now_playing(now), view=QueueControlsView())
+            await panel.edit(content=None, embed=_build_panel_embed(guild_id), view=_make_controls(guild_id))
             _start_now_playing_ticker(guild_id, now, panel)
             return
         except discord.DiscordException:
@@ -95,11 +163,27 @@ async def _advance_and_announce(guild_id: int, voice_client: discord.VoiceClient
     if channel is None:
         return
     try:
-        sent = await channel.send(_format_now_playing(now), view=QueueControlsView())
+        sent = await channel.send(embed=_build_panel_embed(guild_id), view=_make_controls(guild_id))
     except discord.DiscordException:
         return
     now_playing_messages[guild_id] = sent
     _start_now_playing_ticker(guild_id, now, sent)
+
+
+def _parse_time(value: str) -> int | None:
+    parts = value.strip().split(":")
+    if not parts or any(not p.strip() for p in parts):
+        return None
+    try:
+        if len(parts) == 1:
+            return int(parts[0])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    except ValueError:
+        return None
+    return None
 
 
 def _format_time(seconds: float) -> str:
@@ -132,22 +216,25 @@ def _format_now_playing(song: dict) -> str:
 
 
 async def _tick_now_playing(guild_id: int, song: dict, message) -> None:
-    last_content: str | None = None
+    last_fingerprint: tuple | None = None
     try:
         while True:
             await asyncio.sleep(NOW_PLAYING_REFRESH_SECONDS)
             if currently_playing.get(guild_id) is not song:
                 return
-            content = _format_now_playing(song)
-            if content == last_content:
+            fingerprint = _panel_fingerprint(guild_id)
+            if fingerprint == last_fingerprint:
                 continue
             try:
-                await message.edit(content=content)
-                last_content = content
+                await message.edit(content=None, embed=_build_panel_embed(guild_id))
+                last_fingerprint = fingerprint
             except discord.DiscordException:
                 return
     except asyncio.CancelledError:
         return
+    finally:
+        if now_playing_tasks.get(guild_id) is asyncio.current_task():
+            now_playing_tasks.pop(guild_id, None)
 
 
 def _start_now_playing_ticker(guild_id: int, song: dict, message) -> None:
@@ -168,30 +255,159 @@ def _format_queue_lines(guild_id: int) -> list[str]:
     return lines
 
 
-class PlayPositionModal(discord.ui.Modal, title="Enter queue number"):
-    position = discord.ui.TextInput(label="Enter queue number", placeholder="e.g. 3", required=True, max_length=3)
+def _make_progress_bar(elapsed: float, duration: float | None, length: int = 14) -> str:
+    if not duration or duration <= 0:
+        return "─" * length
+    ratio = max(0.0, min(1.0, elapsed / duration))
+    knob_pos = int(round(ratio * (length - 1)))
+    return "━" * knob_pos + "●" + "─" * (length - 1 - knob_pos)
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            position_value = int(self.position.value)
-        except ValueError:
-            await interaction.response.send_message("Position must be a number.", ephemeral=True)
-            return
+
+def _build_panel_embed(guild_id: int) -> discord.Embed:
+    song = currently_playing.get(guild_id)
+    if song is None:
+        return discord.Embed(
+            title="Nothing playing",
+            description="Use `/play` to queue a song.",
+            color=discord.Color.dark_gray(),
+        )
+    paused = song.get("paused_at") is not None
+    elapsed = _elapsed_seconds(song)
+    duration = song.get("duration")
+    bar = _make_progress_bar(elapsed, duration, length=12)
+    elapsed_str = _format_time(elapsed)
+    if duration:
+        description = f"`{elapsed_str} {bar} {_format_time(duration)}`"
+    else:
+        description = f"`{elapsed_str} {bar}`"
+    if queue_expanded.get(guild_id):
+        pending = song_queues.get(guild_id, [])
+        if not pending:
+            description += "\n\n**Up next:**\n*Queue is empty.*"
+        else:
+            entries = list(reversed(list(enumerate(pending, start=1))))
+            lines: list[str] = []
+            running = len(description) + len("\n\n**Up next:**\n")
+            for i, s in entries:
+                link = s.get("webpage_url") or song.get("webpage_url") or ""
+                title_text = (s.get("title") or "Unknown title").replace("[", "(").replace("]", ")")
+                if len(title_text) > 70:
+                    title_text = title_text[:67] + "…"
+                line = f"`{i}.` [{title_text}]({link}) — {s.get('requester', 'unknown')}"
+                if running + len(line) + 1 > 3900:
+                    remaining = len(entries) - len(lines)
+                    lines.append(f"…and {remaining} more")
+                    break
+                lines.append(line)
+                running += len(line) + 1
+            description += "\n\n**Up next:**\n" + "\n".join(lines)
+    embed = discord.Embed(
+        title=song.get("title", "Unknown title"),
+        url=song.get("webpage_url"),
+        description=description,
+        color=discord.Color.gold() if paused else discord.Color.blurple(),
+    )
+    embed.set_author(name="Paused" if paused else "Now playing")
+    requester = song.get("requester")
+    if requester:
+        embed.set_footer(text=f"Requested by {requester}")
+    thumb = song.get("thumbnail")
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+    return embed
+
+
+def _panel_fingerprint(guild_id: int) -> tuple:
+    song = currently_playing.get(guild_id)
+    if song is None:
+        return ("none",)
+    paused = song.get("paused_at") is not None
+    elapsed_str = _format_time(_elapsed_seconds(song))
+    expanded = queue_expanded.get(guild_id, False)
+    queue_titles: tuple = ()
+    if expanded:
+        queue_titles = tuple(s.get("title", "") for s in song_queues.get(guild_id, []))
+    return (song.get("title"), elapsed_str, paused, expanded, queue_titles)
+
+
+def _make_controls(guild_id: int) -> "QueueControlsView":
+    view = QueueControlsView()
+    if queue_expanded.get(guild_id):
+        view.show_queue.label = "Hide Queue"
+    percent = int(round(volume_levels.get(guild_id, DEFAULT_VOLUME) * 100))
+    view.vol_display.label = f"{percent}%"
+    if len(song_queues.get(guild_id, [])) > 1:
+        view.add_item(QueuePlaySelect(guild_id))
+    return view
+
+
+class QueuePlaySelect(discord.ui.Select):
+    def __init__(self, guild_id: int) -> None:
+        pending = song_queues.get(guild_id, [])
+        options: list[discord.SelectOption] = []
+        for i in range(len(pending) - 1, -1, -1):
+            song = pending[i]
+            title = (song.get("title") or "Unknown title")[:95]
+            options.append(discord.SelectOption(label=f"{i + 1}. {title}", value=str(i)))
+            if len(options) >= 25:
+                break
+        super().__init__(
+            placeholder="Play next from queue…",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
         guild_id = interaction.guild.id
-        queue = song_queues.get(guild_id, [])
-        if not queue:
-            await interaction.response.send_message("The queue is empty.", ephemeral=True)
-            return
-        if position_value < 1 or position_value > len(queue):
-            await interaction.response.send_message(
-                f"Position must be between 1 and {len(queue)}.", ephemeral=True
-            )
-            return
-        if position_value == 1:
+        try:
+            idx = int(self.values[0])
+        except (ValueError, IndexError):
             await interaction.response.defer()
             return
-        song = queue.pop(position_value - 1)
+        queue = song_queues.get(guild_id, [])
+        if idx <= 0 or idx >= len(queue):
+            await interaction.response.defer()
+            return
+        song = queue.pop(idx)
         queue.insert(0, song)
+        await interaction.response.edit_message(view=_make_controls(guild_id))
+
+
+class SeekModal(discord.ui.Modal, title="Seek"):
+    position = discord.ui.TextInput(
+        label="Time (mm:ss or seconds)",
+        placeholder="1:30",
+        required=True,
+        max_length=8,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        seconds = _parse_time(self.position.value)
+        guild_id = interaction.guild.id
+        song = currently_playing.get(guild_id)
+        voice_client = interaction.guild.voice_client
+        if seconds is None or song is None or voice_client is None:
+            await interaction.response.defer()
+            return
+        duration = song.get("duration")
+        if duration and seconds >= duration:
+            await interaction.response.defer()
+            return
+        seek_seconds = max(0, seconds)
+        new_entry = {
+            "title": song.get("title"),
+            "url": None,
+            "webpage_url": song.get("webpage_url"),
+            "duration": song.get("duration"),
+            "thumbnail": song.get("thumbnail"),
+            "requester": song.get("requester"),
+            "seek_to": float(seek_seconds),
+        }
+        song_queues.setdefault(guild_id, []).insert(0, new_entry)
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
         await interaction.response.defer()
 
 
@@ -233,15 +449,69 @@ class QueueControlsView(discord.ui.View):
 
     @discord.ui.button(label="Show Queue", style=discord.ButtonStyle.secondary)
     async def show_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        lines = _format_queue_lines(interaction.guild.id)
-        if not lines:
-            await interaction.response.send_message("The queue is empty.", ephemeral=True)
+        guild_id = interaction.guild.id
+        panel = now_playing_messages.get(guild_id)
+        if panel is None or interaction.message.id != panel.id:
+            lines = _format_queue_lines(guild_id)
+            if not lines:
+                await interaction.response.send_message("The queue is empty.", ephemeral=True)
+                return
+            await interaction.response.send_message("\n".join(lines), ephemeral=True)
             return
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        queue_expanded[guild_id] = not queue_expanded.get(guild_id, False)
+        button.label = "Hide Queue" if queue_expanded[guild_id] else "Show Queue"
+        await interaction.response.edit_message(
+            content=None, embed=_build_panel_embed(guild_id), view=self
+        )
 
-    @discord.ui.button(label="Play #", style=discord.ButtonStyle.primary)
-    async def play_position(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(PlayPositionModal())
+    @discord.ui.button(label="Clear Queue", style=discord.ButtonStyle.danger)
+    async def clear_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        guild_id = interaction.guild.id
+        pending_count = len(song_queues.get(guild_id, []))
+        song_queues[guild_id] = []
+        saved_queues.pop(guild_id, None)
+        if pending_count == 0:
+            await interaction.response.send_message("The queue is already empty.", ephemeral=True)
+            return
+        panel = now_playing_messages.get(guild_id)
+        if panel is not None and interaction.message.id == panel.id:
+            await interaction.response.edit_message(
+                content=None, embed=_build_panel_embed(guild_id), view=self
+            )
+            return
+        await interaction.response.send_message(
+            f"Cleared {pending_count} song(s) from the queue.", ephemeral=True
+        )
+
+    @discord.ui.button(label="Vol −10", style=discord.ButtonStyle.secondary, row=1)
+    async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        guild_id = interaction.guild.id
+        current = volume_levels.get(guild_id, DEFAULT_VOLUME)
+        new_level = max(0.0, round(current - 0.10, 2))
+        volume_levels[guild_id] = new_level
+        voice_client = interaction.guild.voice_client
+        if voice_client is not None and voice_client.source is not None:
+            voice_client.source.volume = new_level
+        await interaction.response.edit_message(view=_make_controls(guild_id))
+
+    @discord.ui.button(label="100%", style=discord.ButtonStyle.secondary, disabled=True, row=1)
+    async def vol_display(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        return
+
+    @discord.ui.button(label="Vol +10", style=discord.ButtonStyle.secondary, row=1)
+    async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        guild_id = interaction.guild.id
+        current = volume_levels.get(guild_id, DEFAULT_VOLUME)
+        new_level = min(1.0, round(current + 0.10, 2))
+        volume_levels[guild_id] = new_level
+        voice_client = interaction.guild.voice_client
+        if voice_client is not None and voice_client.source is not None:
+            voice_client.source.volume = new_level
+        await interaction.response.edit_message(view=_make_controls(guild_id))
+
+    @discord.ui.button(label="Seek", style=discord.ButtonStyle.primary, row=1)
+    async def seek_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(SeekModal())
 
 
 @bot.event
@@ -270,6 +540,9 @@ async def play(interaction: discord.Interaction, query: str) -> None:
         return
     target_channel = user_voice_state.channel
     guild_id = interaction.guild.id
+    saved = saved_queues.pop(guild_id, None)
+    if saved:
+        song_queues.setdefault(guild_id, []).extend(saved)
     current_queue_length = len(song_queues.get(guild_id, []))
     if current_queue_length >= MAX_QUEUE_LENGTH:
         await interaction.followup.send(
@@ -283,24 +556,49 @@ async def play(interaction: discord.Interaction, query: str) -> None:
     elif voice_client.channel != target_channel:
         await voice_client.move_to(target_channel)
     try:
-        song = await extract_song_info(query)
+        if _is_playlist_url(query):
+            songs = await extract_playlist_info(query)
+            if not songs:
+                await interaction.followup.send("That playlist is empty or unavailable.")
+                return
+        else:
+            songs = [await extract_song_info(query)]
     except Exception as extraction_error:
-        await interaction.followup.send(f"Could not fetch that song: {extraction_error}")
+        await interaction.followup.send(f"Could not fetch that: {extraction_error}")
         return
-    song["requester"] = interaction.user.display_name
-    song_queues.setdefault(guild_id, []).append(song)
+    remaining_slots = MAX_QUEUE_LENGTH - current_queue_length
+    to_add = songs[:remaining_slots]
+    skipped = len(songs) - len(to_add)
+    for queued_song in to_add:
+        queued_song["requester"] = interaction.user.display_name
+    song_queues.setdefault(guild_id, []).extend(to_add)
     announce_channels[guild_id] = interaction.channel
     if not voice_client.is_playing() and not voice_client.is_paused():
-        play_next(guild_id, voice_client)
+        await play_next(guild_id, voice_client)
+        started = currently_playing.get(guild_id, to_add[0])
+        prefix = ""
+        if len(to_add) > 1:
+            prefix = f"Queued {len(to_add)} songs from playlist"
+            if skipped:
+                prefix += f" ({skipped} skipped — queue cap is {MAX_QUEUE_LENGTH})"
+            prefix += ".\n"
+        queue_expanded.pop(guild_id, None)
         sent = await interaction.followup.send(
-            _format_now_playing(song), view=QueueControlsView()
+            content=prefix.rstrip() if prefix else None,
+            embed=_build_panel_embed(guild_id),
+            view=_make_controls(guild_id),
         )
         now_playing_messages[guild_id] = sent
-        _start_now_playing_ticker(guild_id, song, sent)
+        _start_now_playing_ticker(guild_id, started, sent)
     else:
-        position_in_queue = len(song_queues[guild_id])
+        if len(to_add) == 1:
+            position_in_queue = len(song_queues[guild_id])
+            message = f"Queued **{to_add[0]['title']}** at position {position_in_queue}."
+        else:
+            message = f"Queued {len(to_add)} songs from playlist."
+            if skipped:
+                message += f" ({skipped} skipped — queue cap is {MAX_QUEUE_LENGTH})"
         now_playing_song = currently_playing.get(guild_id)
-        message = f"Queued **{song['title']}** at position {position_in_queue}."
         if now_playing_song:
             message += f"\n{_format_now_playing(now_playing_song)}"
         await interaction.followup.send(message, view=QueueControlsView())
@@ -349,6 +647,11 @@ async def stop(interaction: discord.Interaction) -> None:
     song_queues[guild_id] = []
     currently_playing.pop(guild_id, None)
     now_playing_messages.pop(guild_id, None)
+    saved_queues.pop(guild_id, None)
+    queue_expanded.pop(guild_id, None)
+    existing_task = now_playing_tasks.pop(guild_id, None)
+    if existing_task is not None and not existing_task.done():
+        existing_task.cancel()
     voice_client = interaction.guild.voice_client
     if voice_client is not None and (voice_client.is_playing() or voice_client.is_paused()):
         voice_client.stop()
@@ -373,6 +676,18 @@ async def shuffle(interaction: discord.Interaction) -> None:
         return
     random.shuffle(queue)
     await interaction.response.send_message(f"Shuffled {len(queue)} songs.")
+
+
+@bot.tree.command(name="clearqueue", description="Clear the queue without stopping the current song.")
+async def clearqueue(interaction: discord.Interaction) -> None:
+    guild_id = interaction.guild.id
+    pending_count = len(song_queues.get(guild_id, []))
+    song_queues[guild_id] = []
+    saved_queues.pop(guild_id, None)
+    if pending_count == 0:
+        await interaction.response.send_message("The queue is already empty.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"Cleared {pending_count} song(s) from the queue.")
 
 
 @bot.tree.command(name="qremove", description="Remove a song from the queue by its position.")
@@ -433,11 +748,17 @@ async def volume(interaction: discord.Interaction, level: int) -> None:
     if level < 0 or level > 100:
         await interaction.response.send_message("Volume must be between 0 and 100.", ephemeral=True)
         return
+    guild_id = interaction.guild.id
+    volume_levels[guild_id] = level / 100
     voice_client = interaction.guild.voice_client
-    if voice_client is None or voice_client.source is None:
-        await interaction.response.send_message("Nothing is playing.", ephemeral=True)
-        return
-    voice_client.source.volume = level / 100
+    if voice_client is not None and voice_client.source is not None:
+        voice_client.source.volume = level / 100
+    panel = now_playing_messages.get(guild_id)
+    if panel is not None:
+        try:
+            await panel.edit(view=_make_controls(guild_id))
+        except discord.DiscordException:
+            pass
     await interaction.response.send_message(f"Volume set to {level}%.")
 
 
@@ -448,12 +769,47 @@ async def leave(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
         return
     guild_id = interaction.guild.id
+    pending = list(song_queues.get(guild_id, []))
+    interrupted = currently_playing.get(guild_id)
+    if interrupted is not None:
+        pending.insert(0, interrupted)
+    for queued_song in pending:
+        queued_song.pop("url", None)
+        queued_song.pop("started_at", None)
+        queued_song.pop("paused_total", None)
+        queued_song.pop("paused_at", None)
+    if pending:
+        saved_queues[guild_id] = pending
     song_queues.pop(guild_id, None)
     currently_playing.pop(guild_id, None)
     announce_channels.pop(guild_id, None)
     now_playing_messages.pop(guild_id, None)
+    queue_expanded.pop(guild_id, None)
+    existing_task = now_playing_tasks.pop(guild_id, None)
+    if existing_task is not None and not existing_task.done():
+        existing_task.cancel()
     await voice_client.disconnect()
-    await interaction.response.send_message("Disconnected.")
+    if pending:
+        await interaction.response.send_message(
+            f"Disconnected. {len(pending)} song(s) saved — use /play to resume."
+        )
+    else:
+        await interaction.response.send_message("Disconnected.")
+
+
+_original_close = bot.close
+
+
+async def _close_with_voice_cleanup() -> None:
+    for vc in list(bot.voice_clients):
+        try:
+            await vc.disconnect(force=False)
+        except Exception as disconnect_error:
+            print(f"[shutdown] error disconnecting voice: {disconnect_error}")
+    await _original_close()
+
+
+bot.close = _close_with_voice_cleanup
 
 
 if __name__ == "__main__":
