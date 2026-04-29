@@ -1,7 +1,10 @@
 import os
 import asyncio
+import json
+import logging
 import random
 import time
+from pathlib import Path
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -29,6 +32,92 @@ DEFAULT_VOLUME = 0.5
 
 queue_expanded: dict[int, bool] = {}
 volume_levels: dict[int, float] = {}
+
+_CONFIG_FILE = Path(__file__).parent / "bot_config.json"
+_AUDIT_LOG_FILE = Path(__file__).parent / "bot_audit.log"
+_SETUP_COMMANDS = {"music_show_config", "music_set_channel", "music_set_role"}
+
+guild_config: dict[int, dict] = {}
+
+
+def _load_config() -> None:
+    global guild_config
+    if not _CONFIG_FILE.exists():
+        guild_config = {}
+        return
+    try:
+        with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        guild_config = {int(k): v for k, v in data.items()}
+    except Exception as load_error:
+        print(f"[config] load failed: {load_error}")
+        guild_config = {}
+
+
+def _save_config() -> None:
+    try:
+        with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in guild_config.items()}, f, indent=2)
+    except Exception as save_error:
+        print(f"[config] save failed: {save_error}")
+
+
+_audit_logger = logging.getLogger("jishybot.audit")
+_audit_logger.setLevel(logging.INFO)
+_audit_logger.propagate = False
+if not _audit_logger.handlers:
+    _audit_handler = logging.FileHandler(_AUDIT_LOG_FILE, encoding="utf-8")
+    _audit_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+    _audit_logger.addHandler(_audit_handler)
+
+
+def _audit(interaction: discord.Interaction, action: str) -> None:
+    try:
+        guild_name = interaction.guild.name if interaction.guild else "DM"
+        channel_name = getattr(interaction.channel, "name", None) or str(interaction.channel_id)
+        user = f"{interaction.user}({interaction.user.id})"
+        _audit_logger.info(f"{guild_name} #{channel_name} | {user} | {action}")
+    except Exception:
+        pass
+
+
+def _is_interaction_allowed(interaction: discord.Interaction) -> tuple[bool, str | None]:
+    if interaction.guild is None:
+        return False, "This bot only works in servers, not in DMs."
+    cfg = guild_config.get(interaction.guild.id, {})
+    allowed_channels = cfg.get("allowed_channels") or []
+    if allowed_channels and interaction.channel_id not in allowed_channels:
+        return False, "This bot is restricted to a different channel."
+    allowed_role = cfg.get("allowed_role")
+    if allowed_role:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not any(r.id == allowed_role for r in member.roles):
+            return False, "You don't have the role required to use this bot."
+    return True, None
+
+
+async def _slash_interaction_check(interaction: discord.Interaction) -> bool:
+    try:
+        cmd_name = interaction.command.name if interaction.command else None
+        if cmd_name in _SETUP_COMMANDS and interaction.guild is not None:
+            member = interaction.user
+            if isinstance(member, discord.Member) and member.guild_permissions.administrator:
+                _audit(interaction, f"/{cmd_name}")
+                return True
+        allowed, reason = _is_interaction_allowed(interaction)
+        if not allowed:
+            try:
+                await interaction.response.send_message(
+                    reason or "This bot is restricted here.", ephemeral=True
+                )
+            except (discord.InteractionResponded, discord.HTTPException):
+                pass
+            return False
+        _audit(interaction, f"/{cmd_name or 'unknown'}")
+        return True
+    except Exception as check_error:
+        print(f"[security] slash check error: {check_error}")
+        return False
 
 YTDL_FORMAT_OPTIONS = {
     "format": "bestaudio/best",
@@ -415,6 +504,20 @@ class QueueControlsView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=600)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        allowed, reason = _is_interaction_allowed(interaction)
+        if not allowed:
+            try:
+                await interaction.response.send_message(
+                    reason or "This bot is restricted here.", ephemeral=True
+                )
+            except (discord.InteractionResponded, discord.HTTPException):
+                pass
+            return False
+        custom_id = (interaction.data or {}).get("custom_id") or "unknown"
+        _audit(interaction, f"component:{custom_id}")
+        return True
+
     @discord.ui.button(label="Pause/Play", style=discord.ButtonStyle.success)
     async def pause_play_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         voice_client = interaction.guild.voice_client
@@ -795,6 +898,73 @@ async def leave(interaction: discord.Interaction) -> None:
         )
     else:
         await interaction.response.send_message("Disconnected.")
+
+
+@bot.tree.command(name="music_show_config", description="Show current bot security settings.")
+@app_commands.default_permissions(administrator=True)
+async def music_show_config(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        return
+    cfg = guild_config.get(interaction.guild.id, {})
+    allowed_channels = cfg.get("allowed_channels") or []
+    allowed_role = cfg.get("allowed_role")
+    lines = ["**Bot security settings:**"]
+    if allowed_channels:
+        chs = ", ".join(f"<#{cid}>" for cid in allowed_channels)
+        lines.append(f"Allowed channels: {chs}")
+    else:
+        lines.append("Allowed channels: *all channels*")
+    if allowed_role:
+        lines.append(f"Required role: <@&{allowed_role}>")
+    else:
+        lines.append("Required role: *none (everyone allowed)*")
+    lines.append("DMs: blocked")
+    lines.append(f"Audit log: `{_AUDIT_LOG_FILE.name}` (on disk where the bot runs)")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="music_set_channel", description="Restrict the bot to one channel (admin only).")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(channel="Channel to restrict to. Leave blank to clear restriction.")
+async def music_set_channel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+) -> None:
+    if interaction.guild is None:
+        return
+    cfg = guild_config.setdefault(interaction.guild.id, {})
+    if channel is None:
+        cfg.pop("allowed_channels", None)
+        msg = "Channel restriction cleared. The bot now works in all channels."
+    else:
+        cfg["allowed_channels"] = [channel.id]
+        msg = f"The bot is now restricted to {channel.mention}."
+    _save_config()
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="music_set_role", description="Require a role to use the bot (admin only).")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(role="Role required. Leave blank to clear requirement.")
+async def music_set_role(
+    interaction: discord.Interaction,
+    role: discord.Role | None = None,
+) -> None:
+    if interaction.guild is None:
+        return
+    cfg = guild_config.setdefault(interaction.guild.id, {})
+    if role is None:
+        cfg.pop("allowed_role", None)
+        msg = "Role requirement cleared. All members can use the bot."
+    else:
+        cfg["allowed_role"] = role.id
+        msg = f"The bot now requires the {role.mention} role."
+    _save_config()
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+bot.tree.interaction_check = _slash_interaction_check
+_load_config()
 
 
 _original_close = bot.close
