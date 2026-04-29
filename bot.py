@@ -15,22 +15,11 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 
-def _parse_guild_ids(env_value: str | None) -> list[int]:
-    if not env_value:
-        return []
-    ids: list[int] = []
-    for part in env_value.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            ids.append(int(part))
-        except ValueError:
-            print(f"[config] ignoring invalid guild ID: {part}")
-    return ids
-
-
-INSTANT_SYNC_GUILD_IDS = _parse_guild_ids(os.getenv("INSTANT_SYNC_GUILD_IDS"))
+INSTANT_SYNC_GUILD_IDS = [
+    int(gid.strip())
+    for gid in os.getenv("INSTANT_SYNC_GUILD_IDS", "").split(",")
+    if gid.strip()
+]
 
 intents = discord.Intents.default()
 
