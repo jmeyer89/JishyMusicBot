@@ -197,7 +197,9 @@ async def play_next(guild_id: int, voice_client: discord.VoiceClient) -> None:
     queue = song_queues.get(guild_id, [])
     if not queue:
         currently_playing.pop(guild_id, None)
+        _schedule_inactivity(guild_id)
         return
+    _cancel_inactivity(guild_id)
     next_song = queue.pop(0)
     if not next_song.get("url"):
         source_query = next_song.get("webpage_url") or next_song.get("title")
@@ -331,6 +333,44 @@ def _start_now_playing_ticker(guild_id: int, song: dict, message) -> None:
     if existing is not None and not existing.done():
         existing.cancel()
     now_playing_tasks[guild_id] = asyncio.create_task(_tick_now_playing(guild_id, song, message))
+
+
+inactivity_tasks: dict[int, asyncio.Task] = {}
+INACTIVITY_TIMEOUT_SECONDS = 600
+PAUSED_TIMEOUT_SECONDS = 1200
+
+
+async def _disable_panel_after_inactivity(guild_id: int, seconds: int) -> None:
+    try:
+        await asyncio.sleep(seconds)
+        guild = bot.get_guild(guild_id)
+        voice_client = guild.voice_client if guild else None
+        if voice_client is not None and voice_client.is_playing():
+            return
+        panel = now_playing_messages.get(guild_id)
+        if panel is not None:
+            try:
+                await panel.edit(view=None)
+            except discord.DiscordException:
+                pass
+    except asyncio.CancelledError:
+        return
+    finally:
+        if inactivity_tasks.get(guild_id) is asyncio.current_task():
+            inactivity_tasks.pop(guild_id, None)
+
+
+def _schedule_inactivity(guild_id: int, seconds: int = INACTIVITY_TIMEOUT_SECONDS) -> None:
+    existing = inactivity_tasks.get(guild_id)
+    if existing is not None and not existing.done():
+        existing.cancel()
+    inactivity_tasks[guild_id] = asyncio.create_task(_disable_panel_after_inactivity(guild_id, seconds))
+
+
+def _cancel_inactivity(guild_id: int) -> None:
+    existing = inactivity_tasks.pop(guild_id, None)
+    if existing is not None and not existing.done():
+        existing.cancel()
 
 
 def _format_queue_lines(guild_id: int) -> list[str]:
@@ -502,7 +542,7 @@ class SeekModal(discord.ui.Modal, title="Seek"):
 
 class QueueControlsView(discord.ui.View):
     def __init__(self) -> None:
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         allowed, reason = _is_interaction_allowed(interaction)
@@ -529,6 +569,7 @@ class QueueControlsView(discord.ui.View):
             song = currently_playing.get(interaction.guild.id)
             if song is not None and song.get("paused_at") is None:
                 song["paused_at"] = time.monotonic()
+            _schedule_inactivity(interaction.guild.id, PAUSED_TIMEOUT_SECONDS)
             await interaction.response.defer()
             return
         if voice_client.is_paused():
@@ -537,6 +578,7 @@ class QueueControlsView(discord.ui.View):
             if song is not None and song.get("paused_at") is not None:
                 song["paused_total"] = song.get("paused_total", 0.0) + (time.monotonic() - song["paused_at"])
                 song["paused_at"] = None
+            _cancel_inactivity(interaction.guild.id)
             await interaction.response.defer()
             return
         await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
@@ -727,6 +769,7 @@ async def pause(interaction: discord.Interaction) -> None:
     song = currently_playing.get(interaction.guild.id)
     if song is not None and song.get("paused_at") is None:
         song["paused_at"] = time.monotonic()
+    _schedule_inactivity(interaction.guild.id, PAUSED_TIMEOUT_SECONDS)
     await interaction.response.send_message("Paused.")
 
 
@@ -741,6 +784,7 @@ async def resume(interaction: discord.Interaction) -> None:
     if song is not None and song.get("paused_at") is not None:
         song["paused_total"] = song.get("paused_total", 0.0) + (time.monotonic() - song["paused_at"])
         song["paused_at"] = None
+    _cancel_inactivity(interaction.guild.id)
     await interaction.response.send_message("Resumed.")
 
 
@@ -755,6 +799,7 @@ async def stop(interaction: discord.Interaction) -> None:
     existing_task = now_playing_tasks.pop(guild_id, None)
     if existing_task is not None and not existing_task.done():
         existing_task.cancel()
+    _cancel_inactivity(guild_id)
     voice_client = interaction.guild.voice_client
     if voice_client is not None and (voice_client.is_playing() or voice_client.is_paused()):
         voice_client.stop()
@@ -891,6 +936,7 @@ async def leave(interaction: discord.Interaction) -> None:
     existing_task = now_playing_tasks.pop(guild_id, None)
     if existing_task is not None and not existing_task.done():
         existing_task.cancel()
+    _cancel_inactivity(guild_id)
     await voice_client.disconnect()
     if pending:
         await interaction.response.send_message(
