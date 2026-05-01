@@ -1,23 +1,57 @@
 # Discord Music Bot (Slash Commands)
 
 A Python Discord music bot that streams audio from YouTube using `yt-dlp` and
-FFmpeg. All commands are Discord-native slash commands.
+FFmpeg. All commands are Discord-native slash commands, with an interactive
+now-playing panel that has buttons and dropdowns so you don't have to type
+slash commands for everything.
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `/play <query>` | Search YouTube and play or queue a song |
+| `/play <query>` | Search YouTube (or paste a URL/playlist) and play or queue |
 | `/skip` | Skip the current song |
-| `/pause` | Pause playback |
-| `/resume` | Resume paused playback |
+| `/pause` / `/resume` | Pause or resume playback |
 | `/stop` | Stop playback and clear the queue |
-| `/queue` | Show the current queue |
+| `/queue` | Show the current queue (visible only to you) |
 | `/shuffle` | Randomize the order of the queue |
-| `/remove <position>` | Remove a song from the queue by its position |
+| `/clearqueue` | Clear the queue without stopping the current song |
+| `/qremove <position>` | Remove a song from the queue by its position |
+| `/playnext <position>` | Move a queued song to the top of the queue |
 | `/nowplaying` | Show the currently playing song |
 | `/volume <0-100>` | Set playback volume |
-| `/leave` | Disconnect the bot from voice |
+| `/leave` | Disconnect from voice (queue is saved for next `/play`) |
+
+### Admin-only commands
+| Command | Description |
+|---|---|
+| `/music_show_config` | Show current bot security settings |
+| `/music_set_channel <#channel>` | Restrict bot use to one channel |
+| `/music_set_role <@role>` | Require a role to use the bot |
+
+### The interactive panel
+
+When you `/play` something for the first time, the bot posts a panel in the
+channel showing the current song with a progress bar. The panel has:
+
+- **Pause/Play, Skip, Show Queue, Clear Queue** buttons
+- **Vol −10 / Vol +10 / Seek** controls
+- A **"Play next from queue…"** dropdown (when 2+ songs are queued)
+- A **"Remove from queue…"** dropdown (when 1+ songs are queued)
+
+Slash commands give brief private replies (or no reply at all) so the channel
+stays clean — the panel is the source of truth.
+
+## File layout
+
+```
+bot.py      entrypoint, slash commands, on_ready, shutdown
+config.py   env, constants, audit log, spam guard, channel/role permissions
+state.py    shared dicts (queues, playing songs, panel messages)
+audio.py    yt-dlp + FFmpeg wrappers
+panel.py    embed building, view/dropdowns/modal, ticker, inactivity timer
+player.py   play_next + advance_and_announce
+```
 
 ## 1. Install FFmpeg on Windows
 
@@ -45,16 +79,21 @@ Then close and reopen your terminal so the new `PATH` entry takes effect.
 
 1. Go to <https://discord.com/developers/applications> and click **New Application**.
 2. Name it, then open the **Bot** tab and click **Add Bot**.
-3. Under **Privileged Gateway Intents**, enable **Server Members Intent** and
-   **Message Content Intent** (message content is not required for slash
-   commands, but it's useful to have on for future prefix-style additions).
-4. Click **Reset Token** → **Copy**. Paste this value into `.env`:
+3. Click **Reset Token** → **Copy**. Paste this value into `.env`:
    ```
    DISCORD_TOKEN=paste-your-token-here
    ```
-5. Still in the developer portal, go to **OAuth2 → URL Generator**:
+   (No privileged intents are required — the bot uses default intents only.)
+4. *(Optional)* If you want slash commands to appear instantly in a specific
+   server instead of waiting up to an hour for global sync, add:
+   ```
+   INSTANT_SYNC_GUILD_IDS=123456789012345678
+   ```
+   Multiple IDs can be comma-separated.
+5. In the developer portal, go to **OAuth2 → URL Generator**:
    - Scopes: `bot`, `applications.commands`
-   - Bot permissions: `Connect`, `Speak`, `Send Messages`, `Use Slash Commands`
+   - Bot permissions: `Connect`, `Speak`, `Send Messages`, `Use Slash Commands`,
+     `Embed Links`
    - Copy the generated URL, open it in your browser, and invite the bot to
      your server.
 
@@ -69,10 +108,7 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-On first startup the bot syncs its slash command tree with Discord. Global
-sync can take up to an hour to propagate; if you want your commands to appear
-instantly in a single test server, swap `await bot.tree.sync()` for
-`await bot.tree.sync(guild=discord.Object(id=YOUR_GUILD_ID))`.
+Or just double-click **`start_bot.bat`** once the venv is set up.
 
 ## How it works (plain English)
 
@@ -80,26 +116,29 @@ When you type `/play some song` in a Discord server:
 
 1. The bot joins your voice channel.
 2. It searches YouTube for what you typed.
-3. It grabs the audio from the top result and plays it in the voice channel.
+3. It grabs the audio and plays it.
+4. It posts a control panel with buttons and dropdowns you can click.
 
 If a song is already playing, your new one gets added to a **queue** — a
-waiting list. When the current song ends, the next one in the queue plays
-automatically. When the queue is empty, the bot just sits quietly in the
-voice channel until someone adds more songs or uses `/leave`.
+waiting list. When the current song ends, the next one plays automatically.
 
-Each Discord server has its own separate queue, so if the bot is in two
-servers at once, they don't interfere with each other.
+Each Discord server has its own separate queue.
 
-The bot doesn't save anything to a file or database. If you restart the bot,
-the queue is empty and it forgets what was playing. That's on purpose — it
-keeps things simple.
+If you `/leave`, the queue is saved in memory so the next `/play` resumes
+where you left off. A full bot restart still wipes the queue, but server
+security settings (`/music_set_channel`, `/music_set_role`) are saved to
+`bot_config.json` and persist.
 
-### The two tools doing the real work
+### The tools doing the real work
 
-- **yt-dlp** — knows how to talk to YouTube and find the audio for a video.
-- **FFmpeg** — takes that audio and streams it into Discord.
+- **yt-dlp** — talks to YouTube and finds the audio stream for a video.
+- **FFmpeg** — takes that stream and feeds it to Discord.
 
-Both of these run behind the scenes. You don't use them directly, but
-FFmpeg has to be installed on your computer (that's what section 1 above
-is for). yt-dlp is a Python package that gets installed automatically when
-you run `pip install -r requirements.txt`.
+yt-dlp comes from `pip install`. FFmpeg has to be installed on your computer
+(section 1 above).
+
+### Audit log
+
+Every command and button click is logged to `bot_audit.log` next to the bot
+script (server, channel, user, action). Useful for figuring out who did what
+if something looks off.
