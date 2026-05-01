@@ -9,7 +9,7 @@ slash commands for everything.
 
 | Command | Description |
 |---|---|
-| `/play <query>` | Search YouTube (or paste a URL/playlist) and play or queue |
+| `/play <query>` | Search Spotify (with YouTube fallback) or paste a Spotify/YouTube URL or playlist |
 | `/skip` | Skip the current song |
 | `/pause` / `/resume` | Pause or resume playback |
 | `/stop` | Stop playback and clear the queue |
@@ -45,12 +45,14 @@ stays clean — the panel is the source of truth.
 ## File layout
 
 ```
-bot.py      entrypoint, slash commands, on_ready, shutdown
-config.py   env, constants, audit log, spam guard, channel/role permissions
-state.py    shared dicts (queues, playing songs, panel messages)
-audio.py    yt-dlp + FFmpeg wrappers
-panel.py    embed building, view/dropdowns/modal, ticker, inactivity timer
-player.py   play_next + advance_and_announce
+bot.py         entrypoint, slash commands, on_ready, shutdown
+config.py      env, constants, audit log, spam guard, channel/role permissions
+state.py       shared dicts (queues, playing songs, panel messages)
+audio.py       yt-dlp + FFmpeg wrappers
+spotify.py     Spotify Web API client (URL parsing, search, track lookup)
+spotify_auth.py optional OAuth helper for user-scoped Spotify features
+panel.py       embed building, view/dropdowns/modal, ticker, inactivity timer
+player.py      play_next + advance_and_announce
 ```
 
 ## 1. Install FFmpeg on Windows
@@ -109,6 +111,39 @@ python bot.py
 ```
 
 Or just double-click **`start_bot.bat`** once the venv is set up.
+
+## 4. Spotify Web App Setup
+
+`/play` uses Spotify as the primary metadata source: paste a Spotify track,
+album, or playlist URL and the bot will queue every track; type free text
+and the bot looks the song up on Spotify first (better titles than YouTube
+search) before resolving it on YouTube for actual playback. If Spotify
+isn't configured, `/play` silently falls back to direct YouTube search.
+
+1. In the Spotify Developer Dashboard, create a new app.
+2. Add these values to `.env`:
+   ```env
+   SPOTIFY_CLIENT_ID=your_spotify_client_id
+   SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
+   ```
+   That's all you need — `/play` uses the Client Credentials flow. No
+   browser authorization step is required.
+
+### Optional: user-scoped Spotify (for future features)
+
+If you also want to run `spotify_auth.py` (it requests
+`user-read/modify-playback-state` scopes for future remote-control
+features), add a redirect URI to the app settings (e.g.
+`http://localhost:8888/callback`), set:
+```env
+SPOTIFY_REDIRECT_URI=http://localhost:8888/callback
+```
+then run:
+```powershell
+python spotify_auth.py
+```
+The script writes `SPOTIFY_REFRESH_TOKEN` to `.env`. Use
+`python spotify_auth.py --manual` if the local callback can't reach you.
 
 ## How it works (plain English)
 

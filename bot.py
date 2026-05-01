@@ -1,8 +1,10 @@
+import asyncio
 import random
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+import spotify
 from audio import extract_playlist_info, extract_song_info, is_playlist_url
 from config import (
     AUDIT_LOG_FILE,
@@ -45,6 +47,16 @@ import time
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+async def _delete_after(message: discord.Message, delay: float) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await message.delete()
+    except discord.DiscordException:
+        pass
+    except asyncio.CancelledError:
+        return
 
 
 async def _slash_interaction_check(interaction: discord.Interaction) -> bool:
@@ -93,8 +105,8 @@ async def on_ready() -> None:
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 
-@bot.tree.command(name="play", description="Search YouTube and play or queue a song.")
-@app_commands.describe(query="A YouTube URL or a search term")
+@bot.tree.command(name="play", description="Play or queue a song from Spotify, YouTube, or a search term.")
+@app_commands.describe(query="A Spotify or YouTube URL, or a search term (Spotify is searched first)")
 async def play(interaction: discord.Interaction, query: str) -> None:
     await interaction.response.defer()
     user_voice_state = interaction.user.voice
@@ -119,17 +131,34 @@ async def play(interaction: discord.Interaction, query: str) -> None:
     elif voice_client.channel != target_channel:
         await voice_client.move_to(target_channel)
     try:
-        if is_playlist_url(query):
-            songs = await extract_playlist_info(query)
+        if spotify.is_spotify_url(query):
+            songs = await spotify.extract_spotify_tracks(query)
             if not songs:
                 try:
                     await interaction.delete_original_response()
                 except discord.DiscordException:
                     pass
-                await interaction.followup.send("That playlist is empty or unavailable.", ephemeral=True)
+                await interaction.followup.send("That Spotify link is empty or unavailable.", ephemeral=True)
                 return
+        elif query.startswith(("http://", "https://")):
+            if is_playlist_url(query):
+                songs = await extract_playlist_info(query)
+                if not songs:
+                    try:
+                        await interaction.delete_original_response()
+                    except discord.DiscordException:
+                        pass
+                    await interaction.followup.send("That playlist is empty or unavailable.", ephemeral=True)
+                    return
+            else:
+                songs = [await extract_song_info(query)]
         else:
-            songs = [await extract_song_info(query)]
+            spotify_hit: dict | None = None
+            try:
+                spotify_hit = await spotify.search_top_track(query)
+            except spotify.SpotifyError as spotify_search_error:
+                print(f"[spotify] search failed, falling back to YouTube: {spotify_search_error}")
+            songs = [spotify_hit] if spotify_hit else [await extract_song_info(query)]
     except Exception as extraction_error:
         try:
             await interaction.delete_original_response()
@@ -155,10 +184,24 @@ async def play(interaction: discord.Interaction, query: str) -> None:
         start_now_playing_ticker(guild_id, started, sent)
     else:
         await refresh_panel(guild_id)
+        if len(to_add) == 1:
+            confirmation = f"Queued: **{to_add[0].get('title', 'song')}**"
+        else:
+            confirmation = f"Queued **{len(to_add)}** songs."
+        skipped = len(songs) - len(to_add)
+        if skipped > 0:
+            confirmation += f" ({skipped} skipped — queue is full.)"
         try:
             await interaction.delete_original_response()
-        except discord.DiscordException:
-            pass
+        except discord.DiscordException as delete_error:
+            print(f"[/play] delete_original_response failed: {type(delete_error).__name__}: {delete_error}")
+        try:
+            sent_confirmation = await interaction.followup.send(confirmation)
+        except discord.DiscordException as followup_error:
+            print(f"[/play] followup.send failed: {type(followup_error).__name__}: {followup_error}")
+            sent_confirmation = None
+        if sent_confirmation is not None:
+            asyncio.create_task(_delete_after(sent_confirmation, 10))
 
 
 @bot.tree.command(name="skip", description="Skip the current song.")

@@ -29,7 +29,11 @@ async def play_next(guild_id: int, voice_client: discord.VoiceClient) -> None:
     cancel_inactivity(guild_id)
     next_song = queue.pop(0)
     if not next_song.get("url"):
-        source_query = next_song.get("webpage_url") or next_song.get("title")
+        source_query = (
+            next_song.get("search_query")
+            or next_song.get("webpage_url")
+            or next_song.get("title")
+        )
         if not source_query:
             await play_next(guild_id, voice_client)
             return
