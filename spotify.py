@@ -127,15 +127,13 @@ def _track_to_entry(track: dict, fallback_thumb: str | None = None) -> dict | No
     }
 
 
-async def search_top_track(query: str) -> dict | None:
+async def search_tracks(query: str, limit: int = 10) -> list[dict]:
     data = await _get_json(
         f"{API_BASE}/search",
-        params={"q": query, "type": "track", "limit": 1},
+        params={"q": query, "type": "track", "limit": limit},
     )
     items = (data.get("tracks") or {}).get("items") or []
-    if not items:
-        return None
-    return _track_to_entry(items[0])
+    return [entry for entry in (_track_to_entry(t) for t in items) if entry]
 
 
 async def extract_spotify_tracks(query: str) -> list[dict]:

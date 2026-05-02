@@ -171,12 +171,26 @@ def make_controls(guild_id: int) -> "QueueControlsView":
 
 async def refresh_panel(guild_id: int) -> None:
     panel = now_playing_messages.get(guild_id)
-    if panel is None:
+    if panel is not None:
+        try:
+            await panel.edit(embed=build_panel_embed(guild_id), view=make_controls(guild_id))
+            return
+        except discord.DiscordException:
+            now_playing_messages.pop(guild_id, None)
+    channel = announce_channels.get(guild_id)
+    song = currently_playing.get(guild_id)
+    if channel is None or song is None:
         return
     try:
-        await panel.edit(embed=build_panel_embed(guild_id), view=make_controls(guild_id))
-    except discord.DiscordException:
-        pass
+        new_panel = await channel.send(
+            embed=build_panel_embed(guild_id),
+            view=make_controls(guild_id),
+        )
+    except discord.DiscordException as repost_error:
+        print(f"[refresh_panel] repost failed: {type(repost_error).__name__}: {repost_error}")
+        return
+    now_playing_messages[guild_id] = new_panel
+    start_now_playing_ticker(guild_id, song, new_panel)
 
 
 async def silent_ack(interaction: discord.Interaction) -> None:
@@ -349,6 +363,87 @@ class QueueRemoveSelect(discord.ui.Select):
             await interaction.edit_original_response(embed=build_panel_embed(guild_id), view=make_controls(guild_id))
         except discord.DiscordException as remove_select_error:
             print(f"[QueueRemoveSelect] failed: {type(remove_select_error).__name__}: {remove_select_error}")
+
+
+class SearchPickerView(discord.ui.View):
+    def __init__(self, candidates: list[dict]) -> None:
+        super().__init__(timeout=90)
+        self.candidates = candidates
+        self.add_item(SearchPickerSelect(candidates))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        custom_id = (interaction.data or {}).get("custom_id") or "search_picker"
+        if not await enforce_spam_guard(interaction, f"component:{custom_id}"):
+            return False
+        allowed, reason = is_interaction_allowed(interaction)
+        if not allowed:
+            try:
+                await interaction.response.send_message(
+                    reason or "This bot is restricted here.", ephemeral=True
+                )
+            except (discord.InteractionResponded, discord.HTTPException):
+                pass
+            return False
+        audit(interaction, f"component:{custom_id}")
+        return True
+
+
+class SearchPickerSelect(discord.ui.Select):
+    def __init__(self, candidates: list[dict]) -> None:
+        options: list[discord.SelectOption] = []
+        for index, song in enumerate(candidates[:25], start=1):
+            title = (song.get("title") or "Unknown title")[:95]
+            duration = song.get("duration")
+            description = format_time(duration) if duration else "—"
+            options.append(
+                discord.SelectOption(
+                    label=f"{index}. {title}",
+                    description=description,
+                    value=str(index - 1),
+                )
+            )
+        super().__init__(
+            placeholder="Choose a track…",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+        self.candidates = candidates
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        # Lazy import to keep panel.py free of bot_helpers' transitive imports.
+        from bot_helpers import ensure_voice, queue_and_play
+
+        await interaction.response.defer()
+        try:
+            index = int(self.values[0])
+        except (ValueError, IndexError):
+            return
+        if index < 0 or index >= len(self.candidates):
+            return
+        chosen = self.candidates[index]
+        voice_client = await ensure_voice(interaction)
+        if voice_client is None:
+            try:
+                await interaction.edit_original_response(
+                    content="You need to be in a voice channel to play music.",
+                    view=None,
+                )
+            except discord.DiscordException:
+                pass
+            return
+        await queue_and_play(
+            interaction=interaction,
+            voice_client=voice_client,
+            songs=[chosen],
+        )
+        try:
+            await interaction.edit_original_response(
+                content=f"Queued: **{chosen.get('title', 'song')}**",
+                view=None,
+            )
+        except discord.DiscordException as edit_error:
+            print(f"[SearchPickerSelect] edit failed: {type(edit_error).__name__}: {edit_error}")
 
 
 class SeekModal(discord.ui.Modal, title="Seek"):
