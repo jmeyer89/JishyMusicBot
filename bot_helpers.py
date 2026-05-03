@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 
 import discord
 
@@ -61,6 +62,7 @@ async def queue_and_play(
     to_add = songs[:remaining_slots]
     for queued_song in to_add:
         queued_song["requester"] = interaction.user.display_name
+        queued_song.setdefault("queue_id", uuid.uuid4().hex)
     state.song_queues.setdefault(guild_id, []).extend(to_add)
     state.announce_channels[guild_id] = interaction.channel
     if not voice_client.is_playing() and not voice_client.is_paused():

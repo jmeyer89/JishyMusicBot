@@ -1,5 +1,6 @@
 import asyncio
 import time
+import uuid
 import discord
 
 from config import (
@@ -299,14 +300,27 @@ def cancel_inactivity(guild_id: int) -> None:
         existing.cancel()
 
 
+def _find_by_queue_id(guild_id: int, queue_id: str | None) -> int | None:
+    if not queue_id:
+        return None
+    queue = song_queues.get(guild_id, [])
+    for index, song in enumerate(queue):
+        if song.get("queue_id") == queue_id:
+            return index
+    return None
+
+
 class QueuePlaySelect(discord.ui.Select):
     def __init__(self, guild_id: int) -> None:
         pending = song_queues.get(guild_id, [])
         options: list[discord.SelectOption] = []
         for i in range(len(pending) - 1, 0, -1):
             song = pending[i]
+            qid = song.get("queue_id")
+            if not qid:
+                continue
             title = (song.get("title") or "Unknown title")[:95]
-            options.append(discord.SelectOption(label=f"{i + 1}. {title}", value=str(i)))
+            options.append(discord.SelectOption(label=f"{i + 1}. {title}", value=qid))
             if len(options) >= 25:
                 break
         super().__init__(
@@ -319,15 +333,12 @@ class QueuePlaySelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         guild_id = interaction.guild.id
-        try:
-            idx = int(self.values[0])
-        except (ValueError, IndexError):
+        target_id = self.values[0] if self.values else None
+        idx = _find_by_queue_id(guild_id, target_id)
+        if idx is None or idx == 0:
             await interaction.response.defer()
             return
-        queue = song_queues.get(guild_id, [])
-        if idx <= 0 or idx >= len(queue):
-            await interaction.response.defer()
-            return
+        queue = song_queues[guild_id]
         song = queue.pop(idx)
         queue.insert(0, song)
         try:
@@ -343,8 +354,11 @@ class QueueRemoveSelect(discord.ui.Select):
         options: list[discord.SelectOption] = []
         for i in range(len(pending)):
             song = pending[i]
+            qid = song.get("queue_id")
+            if not qid:
+                continue
             title = (song.get("title") or "Unknown title")[:95]
-            options.append(discord.SelectOption(label=f"{i + 1}. {title}", value=str(i)))
+            options.append(discord.SelectOption(label=f"{i + 1}. {title}", value=qid))
             if len(options) >= 25:
                 break
         super().__init__(
@@ -357,16 +371,12 @@ class QueueRemoveSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         guild_id = interaction.guild.id
-        try:
-            idx = int(self.values[0])
-        except (ValueError, IndexError):
+        target_id = self.values[0] if self.values else None
+        idx = _find_by_queue_id(guild_id, target_id)
+        if idx is None:
             await interaction.response.defer()
             return
-        queue = song_queues.get(guild_id, [])
-        if idx < 0 or idx >= len(queue):
-            await interaction.response.defer()
-            return
-        queue.pop(idx)
+        song_queues[guild_id].pop(idx)
         try:
             await interaction.response.defer()
             await interaction.edit_original_response(embed=build_panel_embed(guild_id), view=make_controls(guild_id))
@@ -487,6 +497,7 @@ class SeekModal(discord.ui.Modal, title="Seek"):
             "thumbnail": song.get("thumbnail"),
             "requester": song.get("requester"),
             "seek_to": float(seek_seconds),
+            "queue_id": uuid.uuid4().hex,
         }
         song_queues.setdefault(guild_id, []).insert(0, new_entry)
         if voice_client.is_playing() or voice_client.is_paused():
