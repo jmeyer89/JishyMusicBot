@@ -151,7 +151,6 @@ class PlaybackCog(commands.Cog):
         guild_id = interaction.guild.id
         state.song_queues[guild_id] = []
         state.currently_playing.pop(guild_id, None)
-        state.now_playing_messages.pop(guild_id, None)
         state.saved_queues.pop(guild_id, None)
         state.queue_expanded.pop(guild_id, None)
         existing_task = state.now_playing_tasks.pop(guild_id, None)
@@ -161,6 +160,7 @@ class PlaybackCog(commands.Cog):
         voice_client = interaction.guild.voice_client
         if voice_client is not None and (voice_client.is_playing() or voice_client.is_paused()):
             voice_client.stop()
+        await panel.clear_panel(guild_id)
         await panel.silent_ack(interaction)
 
     @app_commands.command(name="nowplaying", description="Show the currently playing song.")
@@ -210,12 +210,12 @@ class PlaybackCog(commands.Cog):
         state.song_queues.pop(guild_id, None)
         state.currently_playing.pop(guild_id, None)
         state.announce_channels.pop(guild_id, None)
-        state.now_playing_messages.pop(guild_id, None)
         state.queue_expanded.pop(guild_id, None)
         existing_task = state.now_playing_tasks.pop(guild_id, None)
         if existing_task is not None and not existing_task.done():
             existing_task.cancel()
         panel.cancel_inactivity(guild_id)
+        await panel.clear_panel(guild_id)
         await voice_client.disconnect()
         await panel.silent_ack(interaction)
 

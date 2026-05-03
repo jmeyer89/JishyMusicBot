@@ -169,6 +169,22 @@ def make_controls(guild_id: int) -> "QueueControlsView":
     return view
 
 
+async def clear_panel(guild_id: int) -> None:
+    """Pop the active panel message and remove it from chat. Falls back to stripping controls."""
+    message = now_playing_messages.pop(guild_id, None)
+    if message is None:
+        return
+    try:
+        await message.delete()
+        return
+    except discord.DiscordException:
+        pass
+    try:
+        await message.edit(view=None)
+    except discord.DiscordException:
+        pass
+
+
 async def refresh_panel(guild_id: int) -> None:
     panel = now_playing_messages.get(guild_id)
     if panel is not None:
