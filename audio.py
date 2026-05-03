@@ -19,9 +19,6 @@ YTDL_PLAYLIST_OPTIONS = {
     "extract_flat": "in_playlist",
 }
 
-_ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
-_ytdl_playlist = yt_dlp.YoutubeDL(YTDL_PLAYLIST_OPTIONS)
-
 
 def ffmpeg_options(seek: float | None = None) -> dict:
     before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
@@ -37,9 +34,14 @@ def is_playlist_url(query: str) -> bool:
     return "playlist?list=" in query
 
 
+def _extract(options: dict, query: str) -> dict:
+    with yt_dlp.YoutubeDL(options) as ytdl:
+        return ytdl.extract_info(query, download=False)
+
+
 async def extract_song_info(query: str) -> dict:
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, lambda: _ytdl.extract_info(query, download=False))
+    data = await loop.run_in_executor(None, _extract, YTDL_FORMAT_OPTIONS, query)
     if "entries" in data:
         data = data["entries"][0]
     return {
@@ -53,7 +55,7 @@ async def extract_song_info(query: str) -> dict:
 
 async def extract_playlist_info(query: str) -> list[dict]:
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, lambda: _ytdl_playlist.extract_info(query, download=False))
+    data = await loop.run_in_executor(None, _extract, YTDL_PLAYLIST_OPTIONS, query)
     entries = data.get("entries") or []
     songs: list[dict] = []
     for entry in entries:
