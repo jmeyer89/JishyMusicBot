@@ -112,19 +112,12 @@ def build_panel_embed(guild_id: int) -> discord.Embed:
         else:
             entries = list(reversed(list(enumerate(pending, start=1))))
             lines: list[str] = []
-            running = len(description) + len("\n\n**Up next:**\n")
             for i, s in entries:
                 link = s.get("webpage_url") or song.get("webpage_url") or ""
                 title_text = (s.get("title") or "Unknown title").replace("[", "(").replace("]", ")")
-                if len(title_text) > 70:
-                    title_text = title_text[:67] + "…"
-                line = f"`{i}.` [{title_text}]({link}) — {s.get('requester', 'unknown')}"
-                if running + len(line) + 1 > 3900:
-                    remaining = len(entries) - len(lines)
-                    lines.append(f"…and {remaining} more")
-                    break
-                lines.append(line)
-                running += len(line) + 1
+                if len(title_text) > 50:
+                    title_text = title_text[:47] + "…"
+                lines.append(f"`{i:>2}.` [{title_text}]({link})")
             description += "\n\n**Up next:**\n" + "\n".join(lines)
     embed = discord.Embed(
         title=song.get("title", "Unknown title"),
