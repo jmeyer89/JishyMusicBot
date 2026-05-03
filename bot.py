@@ -3,6 +3,7 @@ from discord.ext import commands
 
 import bot_helpers
 import config
+import panel
 import playlists
 
 
@@ -18,6 +19,7 @@ class JishyBot(commands.Bot):
     async def setup_hook(self) -> None:
         for module in COG_MODULES:
             await self.load_extension(module)
+        self.add_view(panel.QueueControlsView())
 
 
 intents = discord.Intents.default()

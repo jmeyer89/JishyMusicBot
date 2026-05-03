@@ -505,7 +505,7 @@ class QueueControlsView(discord.ui.View):
         audit(interaction, f"component:{custom_id}")
         return True
 
-    @discord.ui.button(label="Pause/Play", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Pause/Play", style=discord.ButtonStyle.success, custom_id="qc:toggle")
     async def pause_play_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         voice_client = interaction.guild.voice_client
         if voice_client is None:
@@ -530,7 +530,7 @@ class QueueControlsView(discord.ui.View):
             return
         await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
 
-    @discord.ui.button(label="Skip", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.danger, custom_id="qc:skip")
     async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         voice_client = interaction.guild.voice_client
         if voice_client is None or not voice_client.is_playing():
@@ -539,7 +539,7 @@ class QueueControlsView(discord.ui.View):
         voice_client.stop()
         await interaction.response.defer()
 
-    @discord.ui.button(label="Show Queue", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Show Queue", style=discord.ButtonStyle.secondary, custom_id="qc:show_queue")
     async def show_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         guild_id = interaction.guild.id
         queue_expanded[guild_id] = not queue_expanded.get(guild_id, False)
@@ -551,7 +551,7 @@ class QueueControlsView(discord.ui.View):
         except Exception as show_queue_error:
             print(f"[show_queue] failed: {type(show_queue_error).__name__}: {show_queue_error}")
 
-    @discord.ui.button(label="Clear Queue", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Clear Queue", style=discord.ButtonStyle.danger, custom_id="qc:clear")
     async def clear_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         guild_id = interaction.guild.id
         pending_count = len(song_queues.get(guild_id, []))
@@ -568,7 +568,7 @@ class QueueControlsView(discord.ui.View):
         except Exception as clear_queue_error:
             print(f"[clear_queue] failed: {type(clear_queue_error).__name__}: {clear_queue_error}")
 
-    @discord.ui.button(label="Vol −10", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Vol −10", style=discord.ButtonStyle.secondary, row=1, custom_id="qc:vol_down")
     async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         guild_id = interaction.guild.id
         current = volume_levels.get(guild_id, DEFAULT_VOLUME)
@@ -583,11 +583,11 @@ class QueueControlsView(discord.ui.View):
         except discord.DiscordException as vol_error:
             print(f"[vol_down] failed: {type(vol_error).__name__}: {vol_error}")
 
-    @discord.ui.button(label="100%", style=discord.ButtonStyle.secondary, disabled=True, row=1)
+    @discord.ui.button(label="100%", style=discord.ButtonStyle.secondary, disabled=True, row=1, custom_id="qc:vol_display")
     async def vol_display(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         return
 
-    @discord.ui.button(label="Vol +10", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Vol +10", style=discord.ButtonStyle.secondary, row=1, custom_id="qc:vol_up")
     async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         guild_id = interaction.guild.id
         current = volume_levels.get(guild_id, DEFAULT_VOLUME)
@@ -602,6 +602,6 @@ class QueueControlsView(discord.ui.View):
         except discord.DiscordException as vol_error:
             print(f"[vol_up] failed: {type(vol_error).__name__}: {vol_error}")
 
-    @discord.ui.button(label="Seek", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="Seek", style=discord.ButtonStyle.primary, row=1, custom_id="qc:seek")
     async def seek_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(SeekModal())
