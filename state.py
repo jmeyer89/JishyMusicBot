@@ -14,3 +14,4 @@ play_locks: dict[int, asyncio.Lock] = {}
 
 queue_expanded: dict[int, bool] = {}
 volume_levels: dict[int, float] = {}
+search_alternatives: dict[int, list[dict]] = {}

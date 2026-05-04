@@ -27,8 +27,8 @@ class PlaybackCog(commands.Cog):
         await interaction.response.defer()
         voice_client = await bot_helpers.ensure_voice(interaction)
         if voice_client is None:
-            await interaction.followup.send(
-                "You need to be in a voice channel first.", ephemeral=True
+            await interaction.edit_original_response(
+                content="You need to be in a voice channel first."
             )
             return
         guild_id = interaction.guild.id
@@ -36,10 +36,11 @@ class PlaybackCog(commands.Cog):
         if saved:
             state.song_queues.setdefault(guild_id, []).extend(saved)
         if len(state.song_queues.get(guild_id, [])) >= config.MAX_QUEUE_LENGTH:
-            await interaction.followup.send(
-                f"The queue is full ({config.MAX_QUEUE_LENGTH} songs max). "
-                "Wait for some to finish or use /stop to clear it.",
-                ephemeral=True,
+            await interaction.edit_original_response(
+                content=(
+                    f"The queue is full ({config.MAX_QUEUE_LENGTH} songs max). "
+                    "Wait for some to finish or use /stop to clear it."
+                )
             )
             return
         picker_alternatives: list[dict] | None = None
@@ -47,24 +48,16 @@ class PlaybackCog(commands.Cog):
             if spotify.is_spotify_url(query):
                 songs = await spotify.extract_spotify_tracks(query)
                 if not songs:
-                    try:
-                        await interaction.delete_original_response()
-                    except discord.DiscordException:
-                        pass
-                    await interaction.followup.send(
-                        "That Spotify link is empty or unavailable.", ephemeral=True
+                    await interaction.edit_original_response(
+                        content="That Spotify link is empty or unavailable."
                     )
                     return
             elif query.startswith(("http://", "https://")):
                 if audio.is_playlist_url(query):
                     songs = await audio.extract_playlist_info(query)
                     if not songs:
-                        try:
-                            await interaction.delete_original_response()
-                        except discord.DiscordException:
-                            pass
-                        await interaction.followup.send(
-                            "That playlist is empty or unavailable.", ephemeral=True
+                        await interaction.edit_original_response(
+                            content="That playlist is empty or unavailable."
                         )
                         return
                 else:
@@ -81,14 +74,18 @@ class PlaybackCog(commands.Cog):
                 else:
                     songs = [await audio.extract_song_info(query)]
         except Exception as extraction_error:
-            try:
-                await interaction.delete_original_response()
-            except discord.DiscordException:
-                pass
-            await interaction.followup.send(
-                f"Could not fetch that: {extraction_error}", ephemeral=True
+            await interaction.edit_original_response(
+                content=f"Could not fetch that: {extraction_error}"
             )
             return
+        if picker_alternatives:
+            state.search_alternatives[guild_id] = picker_alternatives
+        # Fill the deferred slot first so the panel posts as a real followup
+        # rather than getting collapsed into the original response.
+        try:
+            await interaction.edit_original_response(content=f"Queued: **{songs[0].get('title', 'song')}**")
+        except discord.DiscordException as ack_edit_error:
+            print(f"[/play] ack edit failed: {type(ack_edit_error).__name__}: {ack_edit_error}")
         await bot_helpers.queue_and_play(
             interaction=interaction,
             voice_client=voice_client,
@@ -97,16 +94,7 @@ class PlaybackCog(commands.Cog):
         try:
             await interaction.delete_original_response()
         except discord.DiscordException as delete_error:
-            print(f"[/play] delete_original_response failed: {type(delete_error).__name__}: {delete_error}")
-        if picker_alternatives:
-            try:
-                await interaction.followup.send(
-                    f"Queued **{songs[0].get('title', 'song')}** — pick another version to add:",
-                    view=panel.SearchPickerView(picker_alternatives),
-                    ephemeral=True,
-                )
-            except discord.DiscordException as picker_send_error:
-                print(f"[/play] picker send failed: {type(picker_send_error).__name__}: {picker_send_error}")
+            print(f"[/play] delete failed: {type(delete_error).__name__}: {delete_error}")
 
     @app_commands.command(name="skip", description="Skip the current song.")
     async def skip(self, interaction: discord.Interaction) -> None:
@@ -153,6 +141,7 @@ class PlaybackCog(commands.Cog):
         state.currently_playing.pop(guild_id, None)
         state.saved_queues.pop(guild_id, None)
         state.queue_expanded.pop(guild_id, None)
+        state.search_alternatives.pop(guild_id, None)
         existing_task = state.now_playing_tasks.pop(guild_id, None)
         if existing_task is not None and not existing_task.done():
             existing_task.cancel()
@@ -211,6 +200,7 @@ class PlaybackCog(commands.Cog):
         state.currently_playing.pop(guild_id, None)
         state.announce_channels.pop(guild_id, None)
         state.queue_expanded.pop(guild_id, None)
+        state.search_alternatives.pop(guild_id, None)
         existing_task = state.now_playing_tasks.pop(guild_id, None)
         if existing_task is not None and not existing_task.done():
             existing_task.cancel()

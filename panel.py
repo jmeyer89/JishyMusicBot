@@ -22,6 +22,7 @@ from state import (
     now_playing_tasks,
     inactivity_tasks,
     saved_queues,
+    search_alternatives,
 )
 
 
@@ -160,6 +161,9 @@ def make_controls(guild_id: int) -> "QueueControlsView":
         view.add_item(QueuePlaySelect(guild_id))
     if pending_count >= 1:
         view.add_item(QueueRemoveSelect(guild_id))
+    alternatives = search_alternatives.get(guild_id)
+    if alternatives:
+        view.add_item(SearchPickerSelect(alternatives))
     return view
 
 
@@ -267,6 +271,7 @@ async def _auto_disconnect_after_inactivity(guild_id: int, seconds: int, bot: di
         currently_playing.pop(guild_id, None)
         announce_channels.pop(guild_id, None)
         queue_expanded.pop(guild_id, None)
+        search_alternatives.pop(guild_id, None)
         ticker = now_playing_tasks.pop(guild_id, None)
         if ticker is not None and not ticker.done():
             ticker.cancel()
@@ -384,29 +389,6 @@ class QueueRemoveSelect(discord.ui.Select):
             print(f"[QueueRemoveSelect] failed: {type(remove_select_error).__name__}: {remove_select_error}")
 
 
-class SearchPickerView(discord.ui.View):
-    def __init__(self, candidates: list[dict]) -> None:
-        super().__init__(timeout=90)
-        self.candidates = candidates
-        self.add_item(SearchPickerSelect(candidates))
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        custom_id = (interaction.data or {}).get("custom_id") or "search_picker"
-        if not await enforce_spam_guard(interaction, f"component:{custom_id}"):
-            return False
-        allowed, reason = is_interaction_allowed(interaction)
-        if not allowed:
-            try:
-                await interaction.response.send_message(
-                    reason or "This bot is restricted here.", ephemeral=True
-                )
-            except (discord.InteractionResponded, discord.HTTPException):
-                pass
-            return False
-        audit(interaction, f"component:{custom_id}")
-        return True
-
-
 class SearchPickerSelect(discord.ui.Select):
     def __init__(self, candidates: list[dict]) -> None:
         options: list[discord.SelectOption] = []
@@ -422,47 +404,28 @@ class SearchPickerSelect(discord.ui.Select):
                 )
             )
         super().__init__(
-            placeholder="Choose a track…",
+            placeholder="Pick another version to add…",
             options=options,
             min_values=1,
             max_values=1,
+            row=4,
         )
         self.candidates = candidates
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        # Lazy import to keep panel.py free of bot_helpers' transitive imports.
+        # Lazy import: bot_helpers imports panel, so a top-level import would cycle.
         from bot_helpers import ensure_voice, queue_and_play
 
         await interaction.response.defer()
-        try:
-            index = int(self.values[0])
-        except (ValueError, IndexError):
-            return
-        if index < 0 or index >= len(self.candidates):
-            return
-        chosen = self.candidates[index]
+        chosen = dict(self.candidates[int(self.values[0])])
         voice_client = await ensure_voice(interaction)
         if voice_client is None:
-            try:
-                await interaction.edit_original_response(
-                    content="You need to be in a voice channel to play music.",
-                    view=None,
-                )
-            except discord.DiscordException:
-                pass
             return
         await queue_and_play(
             interaction=interaction,
             voice_client=voice_client,
             songs=[chosen],
         )
-        try:
-            await interaction.edit_original_response(
-                content=f"Queued: **{chosen.get('title', 'song')}**",
-                view=None,
-            )
-        except discord.DiscordException as edit_error:
-            print(f"[SearchPickerSelect] edit failed: {type(edit_error).__name__}: {edit_error}")
 
 
 class SeekModal(discord.ui.Modal, title="Seek"):
