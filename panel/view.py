@@ -40,6 +40,33 @@ def _find_by_queue_id(guild_id: int, queue_id: str | None) -> int | None:
     return None
 
 
+def _queue_select_options(
+    guild_id: int, *, exclude_first: bool, reverse: bool
+) -> list[discord.SelectOption]:
+    """Build SelectOption list for the queue Play/Remove dropdowns.
+
+    `exclude_first` skips index 0 (the next-up song — already implicitly next,
+    so showing it in 'Play next from queue' would be a no-op).
+    `reverse` shows most-recently-queued first.
+    """
+    pending = song_queues.get(guild_id, [])
+    start = 1 if exclude_first else 0
+    indices = range(start, len(pending))
+    if reverse:
+        indices = reversed(indices)
+    options: list[discord.SelectOption] = []
+    for i in indices:
+        song = pending[i]
+        qid = song.get("queue_id")
+        if not qid:
+            continue
+        title = (song.get("title") or "Unknown title")[:95]
+        options.append(discord.SelectOption(label=f"{i + 1}. {title}", value=qid))
+        if len(options) >= 25:
+            break
+    return options
+
+
 def make_controls(guild_id: int) -> "QueueControlsView":
     view = QueueControlsView()
     if queue_expanded.get(guild_id):
@@ -59,20 +86,9 @@ def make_controls(guild_id: int) -> "QueueControlsView":
 
 class QueuePlaySelect(discord.ui.Select):
     def __init__(self, guild_id: int) -> None:
-        pending = song_queues.get(guild_id, [])
-        options: list[discord.SelectOption] = []
-        for i in range(len(pending) - 1, 0, -1):
-            song = pending[i]
-            qid = song.get("queue_id")
-            if not qid:
-                continue
-            title = (song.get("title") or "Unknown title")[:95]
-            options.append(discord.SelectOption(label=f"{i + 1}. {title}", value=qid))
-            if len(options) >= 25:
-                break
         super().__init__(
             placeholder="Play next from queue…",
-            options=options,
+            options=_queue_select_options(guild_id, exclude_first=True, reverse=True),
             min_values=1,
             max_values=1,
             row=2,
@@ -96,20 +112,9 @@ class QueuePlaySelect(discord.ui.Select):
 
 class QueueRemoveSelect(discord.ui.Select):
     def __init__(self, guild_id: int) -> None:
-        pending = song_queues.get(guild_id, [])
-        options: list[discord.SelectOption] = []
-        for i in range(len(pending)):
-            song = pending[i]
-            qid = song.get("queue_id")
-            if not qid:
-                continue
-            title = (song.get("title") or "Unknown title")[:95]
-            options.append(discord.SelectOption(label=f"{i + 1}. {title}", value=qid))
-            if len(options) >= 25:
-                break
         super().__init__(
             placeholder="Remove from queue…",
-            options=options,
+            options=_queue_select_options(guild_id, exclude_first=False, reverse=False),
             min_values=1,
             max_values=1,
             row=3,
