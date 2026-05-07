@@ -3,6 +3,7 @@ import json
 import logging
 import time
 from collections import deque
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import discord
 from dotenv import load_dotenv
@@ -67,7 +68,11 @@ _audit_logger = logging.getLogger("jishybot.audit")
 _audit_logger.setLevel(logging.INFO)
 _audit_logger.propagate = False
 if not _audit_logger.handlers:
-    _audit_handler = logging.FileHandler(AUDIT_LOG_FILE, encoding="utf-8")
+    # Rotate at ~1 MB and keep the last 4 backups → ~5 MB cap, ~few weeks of
+    # history at typical use. Bounds disk usage and the privacy exposure window.
+    _audit_handler = RotatingFileHandler(
+        AUDIT_LOG_FILE, maxBytes=1_000_000, backupCount=4, encoding="utf-8"
+    )
     _audit_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
     _audit_logger.addHandler(_audit_handler)
 
