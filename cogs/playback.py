@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 import discord
@@ -73,6 +74,11 @@ class PlaybackCog(commands.Cog):
                     picker_alternatives = candidates[1:] or None
                 else:
                     songs = [await audio.extract_song_info(query)]
+        except asyncio.TimeoutError:
+            await interaction.edit_original_response(
+                content="That took too long to load. Try a different link or a smaller playlist."
+            )
+            return
         except Exception as extraction_error:
             await interaction.edit_original_response(
                 content=f"Could not fetch that: {extraction_error}"
