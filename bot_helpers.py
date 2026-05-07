@@ -3,10 +3,18 @@ import uuid
 
 import discord
 
+import audio
 import config
 import panel
 import player
+import spotify
 import state
+
+
+class QueryResolutionError(Exception):
+    """Raised by resolve_query for known, user-facing failure modes (empty
+    Spotify link, empty playlist, etc.). The message is shown verbatim to the
+    user."""
 
 
 async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
@@ -43,6 +51,39 @@ async def send_transient(
         return
     if sent is not None:
         asyncio.create_task(delete_after(sent, delay))
+
+
+async def resolve_query(query: str) -> tuple[list[dict], list[dict] | None]:
+    """Resolve a /play argument into songs to queue.
+
+    Returns (songs, picker_alternatives_or_None). Routes the query through
+    Spotify (URLs first, free-text search second) and falls back to YouTube.
+
+    Raises QueryResolutionError for known failure modes (empty link, etc.).
+    Raises asyncio.TimeoutError or other exceptions from the underlying
+    extractors for unexpected failures — callers should catch both.
+    """
+    if spotify.is_spotify_url(query):
+        songs = await spotify.extract_spotify_tracks(query)
+        if not songs:
+            raise QueryResolutionError("That Spotify link is empty or unavailable.")
+        return songs, None
+    if query.startswith(("http://", "https://")):
+        if audio.is_playlist_url(query):
+            songs = await audio.extract_playlist_info(query)
+            if not songs:
+                raise QueryResolutionError("That playlist is empty or unavailable.")
+            return songs, None
+        return [await audio.extract_song_info(query)], None
+    # Free-text: try Spotify first (better titles), fall back to YouTube search.
+    candidates: list[dict] = []
+    try:
+        candidates = await spotify.search_tracks(query, limit=10)
+    except spotify.SpotifyError as spotify_search_error:
+        print(f"[spotify] search failed, falling back to YouTube: {spotify_search_error}")
+    if candidates:
+        return [candidates[0]], (candidates[1:] or None)
+    return [await audio.extract_song_info(query)], None
 
 
 async def teardown_guild_session(

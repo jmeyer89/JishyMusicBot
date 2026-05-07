@@ -5,11 +5,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-import audio
 import bot_helpers
 import config
 import panel
-import spotify
 import state
 
 
@@ -44,36 +42,11 @@ class PlaybackCog(commands.Cog):
                 )
             )
             return
-        picker_alternatives: list[dict] | None = None
         try:
-            if spotify.is_spotify_url(query):
-                songs = await spotify.extract_spotify_tracks(query)
-                if not songs:
-                    await interaction.edit_original_response(
-                        content="That Spotify link is empty or unavailable."
-                    )
-                    return
-            elif query.startswith(("http://", "https://")):
-                if audio.is_playlist_url(query):
-                    songs = await audio.extract_playlist_info(query)
-                    if not songs:
-                        await interaction.edit_original_response(
-                            content="That playlist is empty or unavailable."
-                        )
-                        return
-                else:
-                    songs = [await audio.extract_song_info(query)]
-            else:
-                candidates: list[dict] = []
-                try:
-                    candidates = await spotify.search_tracks(query, limit=10)
-                except spotify.SpotifyError as spotify_search_error:
-                    print(f"[spotify] search failed, falling back to YouTube: {spotify_search_error}")
-                if candidates:
-                    songs = [candidates[0]]
-                    picker_alternatives = candidates[1:] or None
-                else:
-                    songs = [await audio.extract_song_info(query)]
+            songs, picker_alternatives = await bot_helpers.resolve_query(query)
+        except bot_helpers.QueryResolutionError as resolve_error:
+            await interaction.edit_original_response(content=str(resolve_error))
+            return
         except asyncio.TimeoutError:
             await interaction.edit_original_response(
                 content="That took too long to load. Try a different link or a smaller playlist."
