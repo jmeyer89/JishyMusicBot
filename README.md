@@ -145,6 +145,29 @@ python spotify_auth.py
 The script writes `SPOTIFY_REFRESH_TOKEN` to `.env`. Use
 `python spotify_auth.py --manual` if the local callback can't reach you.
 
+## 5. Optional: YouTube cookies (age-restricted / region-blocked videos)
+
+YouTube blocks some videos (age-restricted, region-locked, members-only)
+unless the request comes from a logged-in session. If `/play` fails on those
+with errors like *"Sign in to confirm your age"*, point yt-dlp at a cookies
+file exported from a logged-in browser session.
+
+1. Install a "Get cookies.txt" browser extension (Chrome/Firefox), open
+   <https://www.youtube.com> while logged in, and export cookies for the
+   site in **Netscape** format. Save the file somewhere private (it grants
+   access to your account).
+2. Add the absolute path to `.env`:
+   ```env
+   YOUTUBE_COOKIES_FILE=C:\path\to\youtube_cookies.txt
+   ```
+3. Restart the bot. On startup it logs `[audio] YOUTUBE_COOKIES_FILE set
+   but not found: …` if the path is wrong, and otherwise silently uses the
+   cookies for every extraction.
+
+The repo's `.gitignore` already excludes `youtube_cookies.txt` and
+`cookies.txt` so a stray file in the project directory won't get committed,
+but storing the file outside the repo is safer.
+
 ## How it works (plain English)
 
 When you type `/play some song` in a Discord server:
