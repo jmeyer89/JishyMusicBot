@@ -5,14 +5,13 @@ import discord
 from audio import extract_song_info, ffmpeg_options
 from config import DEFAULT_VOLUME
 from panel import (
-    build_panel_embed,
     cancel_inactivity,
-    make_controls,
+    ensure_panel_writer,
+    request_panel_update,
     schedule_inactivity,
     start_now_playing_ticker,
 )
 from state import (
-    announce_channels,
     currently_playing,
     now_playing_messages,
     play_locks,
@@ -46,7 +45,10 @@ async def play_next(guild_id: int, voice_client: discord.VoiceClient) -> bool:
                 if not source_query:
                     continue
                 try:
-                    fresh = await extract_song_info(source_query)
+                    fresh = await extract_song_info(
+                        source_query,
+                        expected_duration=next_song.get("duration"),
+                    )
                 except Exception as extraction_error:
                     print(f"[player] could not refresh URL for {next_song.get('title', source_query)}: {extraction_error}")
                     continue
@@ -92,20 +94,9 @@ async def advance_and_announce(guild_id: int, voice_client: discord.VoiceClient)
     now = currently_playing.get(guild_id)
     if not now:
         return
-    panel = now_playing_messages.get(guild_id)
-    if panel is not None:
-        try:
-            await panel.edit(content=None, embed=build_panel_embed(guild_id), view=make_controls(guild_id))
-            start_now_playing_ticker(guild_id, now, panel)
-            return
-        except discord.DiscordException:
-            now_playing_messages.pop(guild_id, None)
-    channel = announce_channels.get(guild_id)
-    if channel is None:
+    if now_playing_messages.get(guild_id) is None:
+        # Panel was deleted by the user; don't repost. Next /play will create one.
         return
-    try:
-        sent = await channel.send(embed=build_panel_embed(guild_id), view=make_controls(guild_id))
-    except discord.DiscordException:
-        return
-    now_playing_messages[guild_id] = sent
-    start_now_playing_ticker(guild_id, now, sent)
+    ensure_panel_writer(guild_id)
+    request_panel_update(guild_id)
+    start_now_playing_ticker(guild_id, now)
