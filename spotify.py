@@ -5,7 +5,7 @@ import time
 
 import requests
 
-from config import SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET
+from config import MAX_QUEUE_LENGTH, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET
 
 
 API_BASE = "https://api.spotify.com/v1"
@@ -158,6 +158,8 @@ async def extract_spotify_tracks(query: str) -> list[dict]:
             entry = _track_to_entry(track, fallback_thumb=thumb)
             if entry:
                 entries.append(entry)
+                if len(entries) >= MAX_QUEUE_LENGTH:
+                    return entries
         next_url = (album.get("tracks") or {}).get("next")
         while next_url:
             page = await _get_json(next_url)
@@ -166,6 +168,8 @@ async def extract_spotify_tracks(query: str) -> list[dict]:
                 entry = _track_to_entry(track, fallback_thumb=thumb)
                 if entry:
                     entries.append(entry)
+                    if len(entries) >= MAX_QUEUE_LENGTH:
+                        return entries
             next_url = page.get("next")
         return entries
 
@@ -182,6 +186,8 @@ async def extract_spotify_tracks(query: str) -> list[dict]:
                 entry = _track_to_entry(track)
                 if entry:
                     entries.append(entry)
+                    if len(entries) >= MAX_QUEUE_LENGTH:
+                        return entries
             url = page.get("next")
             params = None
         return entries
