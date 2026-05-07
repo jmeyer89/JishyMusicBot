@@ -142,20 +142,13 @@ class PlaybackCog(commands.Cog):
 
     @app_commands.command(name="stop", description="Stop playback and clear the queue.")
     async def stop(self, interaction: discord.Interaction) -> None:
-        guild_id = interaction.guild.id
-        state.song_queues[guild_id] = []
-        state.currently_playing.pop(guild_id, None)
-        state.saved_queues.pop(guild_id, None)
-        state.queue_expanded.pop(guild_id, None)
-        state.search_alternatives.pop(guild_id, None)
-        existing_task = state.now_playing_tasks.pop(guild_id, None)
-        if existing_task is not None and not existing_task.done():
-            existing_task.cancel()
-        panel.cancel_inactivity(guild_id)
-        voice_client = interaction.guild.voice_client
-        if voice_client is not None and (voice_client.is_playing() or voice_client.is_paused()):
-            voice_client.stop()
-        await panel.clear_panel(guild_id)
+        await bot_helpers.teardown_guild_session(
+            interaction.guild.id,
+            interaction.guild.voice_client,
+            disconnect=False,
+            preserve_queue=False,
+            delete_panel=True,
+        )
         await panel.silent_ack(interaction)
 
     @app_commands.command(name="nowplaying", description="Show the currently playing song.")
@@ -190,29 +183,13 @@ class PlaybackCog(commands.Cog):
         if voice_client is None:
             await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
             return
-        guild_id = interaction.guild.id
-        pending = list(state.song_queues.get(guild_id, []))
-        interrupted = state.currently_playing.get(guild_id)
-        if interrupted is not None:
-            pending.insert(0, interrupted)
-        for queued_song in pending:
-            queued_song.pop("url", None)
-            queued_song.pop("started_at", None)
-            queued_song.pop("paused_total", None)
-            queued_song.pop("paused_at", None)
-        if pending:
-            state.saved_queues[guild_id] = pending
-        state.song_queues.pop(guild_id, None)
-        state.currently_playing.pop(guild_id, None)
-        state.announce_channels.pop(guild_id, None)
-        state.queue_expanded.pop(guild_id, None)
-        state.search_alternatives.pop(guild_id, None)
-        existing_task = state.now_playing_tasks.pop(guild_id, None)
-        if existing_task is not None and not existing_task.done():
-            existing_task.cancel()
-        panel.cancel_inactivity(guild_id)
-        await panel.clear_panel(guild_id)
-        await voice_client.disconnect()
+        await bot_helpers.teardown_guild_session(
+            interaction.guild.id,
+            voice_client,
+            disconnect=True,
+            preserve_queue=True,
+            delete_panel=True,
+        )
         await panel.silent_ack(interaction)
 
 

@@ -45,6 +45,63 @@ async def send_transient(
         asyncio.create_task(delete_after(sent, delay))
 
 
+async def teardown_guild_session(
+    guild_id: int,
+    voice_client: discord.VoiceClient | None,
+    *,
+    disconnect: bool,
+    preserve_queue: bool,
+    delete_panel: bool,
+) -> None:
+    """Tear down a guild's playback session.
+
+    Used by /stop (no disconnect, no preserve, delete panel),
+    /leave (disconnect, preserve, delete panel), and the inactivity
+    auto-disconnect (disconnect, preserve, strip panel controls but keep
+    the message in chat for context).
+    """
+    if preserve_queue:
+        pending = list(state.song_queues.get(guild_id, []))
+        interrupted = state.currently_playing.get(guild_id)
+        if interrupted is not None:
+            pending.insert(0, interrupted)
+        for queued_song in pending:
+            queued_song.pop("url", None)
+            queued_song.pop("started_at", None)
+            queued_song.pop("paused_total", None)
+            queued_song.pop("paused_at", None)
+        if pending:
+            state.saved_queues[guild_id] = pending
+    else:
+        state.saved_queues.pop(guild_id, None)
+    state.song_queues.pop(guild_id, None)
+    state.currently_playing.pop(guild_id, None)
+    state.announce_channels.pop(guild_id, None)
+    state.queue_expanded.pop(guild_id, None)
+    state.search_alternatives.pop(guild_id, None)
+    existing_task = state.now_playing_tasks.pop(guild_id, None)
+    if existing_task is not None and not existing_task.done():
+        existing_task.cancel()
+    panel.cancel_inactivity(guild_id)
+    if voice_client is not None and (voice_client.is_playing() or voice_client.is_paused()):
+        voice_client.stop()
+    if delete_panel:
+        await panel.clear_panel(guild_id)
+    else:
+        panel.stop_panel_writer(guild_id)
+        message = state.now_playing_messages.pop(guild_id, None)
+        if message is not None:
+            try:
+                await message.edit(view=None)
+            except discord.DiscordException:
+                pass
+    if disconnect and voice_client is not None:
+        try:
+            await voice_client.disconnect(force=False)
+        except discord.DiscordException:
+            pass
+
+
 async def queue_and_play(
     interaction: discord.Interaction,
     voice_client: discord.VoiceClient,

@@ -14,7 +14,6 @@ from config import (
     is_interaction_allowed,
 )
 from state import (
-    announce_channels,
     song_queues,
     currently_playing,
     queue_expanded,
@@ -317,36 +316,16 @@ async def _auto_disconnect_after_inactivity(guild_id: int, seconds: int, bot: di
         voice_client = guild.voice_client
         if voice_client is None or voice_client.is_playing():
             return
-        pending = list(song_queues.get(guild_id, []))
-        interrupted = currently_playing.get(guild_id)
-        if interrupted is not None:
-            pending.insert(0, interrupted)
-        for s in pending:
-            s.pop("url", None)
-            s.pop("started_at", None)
-            s.pop("paused_total", None)
-            s.pop("paused_at", None)
-        if pending:
-            saved_queues[guild_id] = pending
-        song_queues.pop(guild_id, None)
-        currently_playing.pop(guild_id, None)
-        announce_channels.pop(guild_id, None)
-        queue_expanded.pop(guild_id, None)
-        search_alternatives.pop(guild_id, None)
-        ticker = now_playing_tasks.pop(guild_id, None)
-        if ticker is not None and not ticker.done():
-            ticker.cancel()
-        stop_panel_writer(guild_id)
-        panel = now_playing_messages.pop(guild_id, None)
-        if panel is not None:
-            try:
-                await panel.edit(view=None)
-            except discord.DiscordException:
-                pass
-        try:
-            await voice_client.disconnect(force=False)
-        except discord.DiscordException:
-            pass
+        # Lazy import: bot_helpers imports panel at module load, so importing
+        # bot_helpers at module top here would cycle.
+        from bot_helpers import teardown_guild_session
+        await teardown_guild_session(
+            guild_id,
+            voice_client,
+            disconnect=True,
+            preserve_queue=True,
+            delete_panel=False,
+        )
     except asyncio.CancelledError:
         return
     finally:
@@ -362,7 +341,13 @@ def schedule_inactivity(guild_id: int, bot: discord.Client, seconds: int = INACT
 
 
 def cancel_inactivity(guild_id: int) -> None:
-    existing = inactivity_tasks.pop(guild_id, None)
+    existing = inactivity_tasks.get(guild_id)
+    # If we're being called from inside the inactivity task itself (via
+    # teardown_guild_session), don't cancel ourselves mid-cleanup — the task's
+    # finally clause will pop the entry on exit.
+    if existing is asyncio.current_task():
+        return
+    inactivity_tasks.pop(guild_id, None)
     if existing is not None and not existing.done():
         existing.cancel()
 
