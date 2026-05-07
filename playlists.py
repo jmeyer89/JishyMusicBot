@@ -70,6 +70,56 @@ def save_queue(
     return True, f"{verb} **{name.strip()}** with {len(songs)} song(s)."
 
 
+def create_playlist(guild_id: int, name: str, requester: str) -> tuple[bool, str]:
+    """Create a new empty playlist. Returns (success, user_facing_message)."""
+    normalized = _normalize(name)
+    if not normalized:
+        return False, "Playlist name cannot be empty."
+    guild_playlists = playlists.setdefault(guild_id, {})
+    if normalized in guild_playlists:
+        return False, f"Playlist **{name.strip()}** already exists."
+    if len(guild_playlists) >= MAX_PLAYLISTS_PER_GUILD:
+        return False, f"Maximum saved playlists reached ({MAX_PLAYLISTS_PER_GUILD}). Delete one first."
+    guild_playlists[normalized] = {
+        "songs": [],
+        "saved_by": requester,
+        "saved_at": time.time(),
+        "display_name": name.strip()[:PLAYLIST_NAME_MAX],
+    }
+    save_playlists_to_disk()
+    return True, f"Created empty playlist **{name.strip()}**."
+
+
+def add_song_to_playlist(
+    guild_id: int,
+    name: str,
+    song: dict,
+    requester: str,
+) -> tuple[bool, str]:
+    """Append a song to an existing playlist. Dedupes by webpage_url so the
+    same song can't be added twice. Returns (success, user_facing_message)."""
+    if not song:
+        return False, "No song to add."
+    normalized = _normalize(name)
+    guild_playlists = playlists.get(guild_id, {})
+    entry = guild_playlists.get(normalized)
+    if entry is None:
+        return False, f"No playlist named **{name}**."
+    stripped = _strip_song(song)
+    title = stripped.get("title") or "song"
+    display = entry.get("display_name", normalized)
+    existing_url = stripped.get("webpage_url")
+    if existing_url:
+        for existing in entry.get("songs", []):
+            if existing.get("webpage_url") == existing_url:
+                return False, f"**{title}** is already in **{display}**."
+    entry.setdefault("songs", []).append(stripped)
+    entry["saved_at"] = time.time()
+    entry["saved_by"] = requester
+    save_playlists_to_disk()
+    return True, f"Added **{title}** to **{display}**."
+
+
 def load_queue(guild_id: int, name: str) -> list[dict] | None:
     normalized = _normalize(name)
     guild_playlists = playlists.get(guild_id, {})
