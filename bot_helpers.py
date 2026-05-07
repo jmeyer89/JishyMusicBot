@@ -70,16 +70,23 @@ async def queue_and_play(
         if started_fresh:
             started = state.currently_playing.get(guild_id, to_add[0])
             state.queue_expanded.pop(guild_id, None)
-            try:
-                sent = await interaction.followup.send(
-                    embed=panel.build_panel_embed(guild_id),
-                    view=panel.make_controls(guild_id),
-                )
-            except discord.DiscordException as panel_send_error:
-                print(f"[queue_and_play] panel send failed: {type(panel_send_error).__name__}: {panel_send_error}")
-                return
-            state.now_playing_messages[guild_id] = sent
-            panel.start_now_playing_ticker(guild_id, started, sent)
+            existing_panel = state.now_playing_messages.get(guild_id)
+            if existing_panel is None:
+                # Send via the channel (not interaction.followup) so the resulting
+                # Message edits with the bot token. Followup messages are webhook
+                # messages whose tokens expire after 15 minutes (error 50027).
+                try:
+                    sent = await interaction.channel.send(
+                        embed=panel.build_panel_embed(guild_id),
+                        view=panel.make_controls(guild_id),
+                    )
+                except discord.DiscordException as panel_send_error:
+                    print(f"[queue_and_play] panel send failed: {type(panel_send_error).__name__}: {panel_send_error}")
+                    return
+                state.now_playing_messages[guild_id] = sent
+            panel.ensure_panel_writer(guild_id)
+            panel.request_panel_update(guild_id)
+            panel.start_now_playing_ticker(guild_id, started)
             return
     await panel.refresh_panel(guild_id)
     if len(to_add) == 1:
