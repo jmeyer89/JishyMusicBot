@@ -6,6 +6,7 @@ import discord
 from config import (
     DEFAULT_VOLUME,
     NOW_PLAYING_REFRESH_SECONDS,
+    PANEL_MIN_EDIT_INTERVAL,
     INACTIVITY_TIMEOUT_SECONDS,
     PAUSED_TIMEOUT_SECONDS,
     audit,
@@ -23,6 +24,9 @@ from state import (
     inactivity_tasks,
     saved_queues,
     search_alternatives,
+    panel_writer_tasks,
+    panel_update_events,
+    panel_last_edit_at,
 )
 
 
@@ -142,12 +146,16 @@ def panel_fingerprint(guild_id: int) -> tuple:
     if song is None:
         return ("none",)
     paused = song.get("paused_at") is not None
-    elapsed_str = format_time(elapsed_seconds(song))
+    # Bucket elapsed in 10s increments so the ticker only forces redraws when the
+    # displayed time actually moves a meaningful amount.
+    elapsed_bucket = int(elapsed_seconds(song) // 10)
     expanded = queue_expanded.get(guild_id, False)
-    queue_titles: tuple = ()
+    queue_ids: tuple = ()
     if expanded:
-        queue_titles = tuple(s.get("title", "") for s in song_queues.get(guild_id, []))
-    return (song.get("title"), elapsed_str, paused, expanded, queue_titles)
+        queue_ids = tuple(s.get("queue_id", "") for s in song_queues.get(guild_id, []))
+    volume_pct = int(round(volume_levels.get(guild_id, DEFAULT_VOLUME) * 100))
+    has_alts = bool(search_alternatives.get(guild_id))
+    return (song.get("title"), elapsed_bucket, paused, expanded, queue_ids, volume_pct, has_alts)
 
 
 def make_controls(guild_id: int) -> "QueueControlsView":
@@ -169,6 +177,7 @@ def make_controls(guild_id: int) -> "QueueControlsView":
 
 async def clear_panel(guild_id: int) -> None:
     """Pop the active panel message and remove it from chat. Falls back to stripping controls."""
+    stop_panel_writer(guild_id)
     message = now_playing_messages.pop(guild_id, None)
     if message is None:
         return
@@ -183,28 +192,87 @@ async def clear_panel(guild_id: int) -> None:
         pass
 
 
-async def refresh_panel(guild_id: int) -> None:
-    panel = now_playing_messages.get(guild_id)
-    if panel is not None:
-        try:
-            await panel.edit(embed=build_panel_embed(guild_id), view=make_controls(guild_id))
-            return
-        except discord.DiscordException:
-            now_playing_messages.pop(guild_id, None)
-    channel = announce_channels.get(guild_id)
-    song = currently_playing.get(guild_id)
-    if channel is None or song is None:
+def request_panel_update(guild_id: int) -> None:
+    """Signal the per-guild writer that the panel needs a redraw. Idempotent and cheap."""
+    event = panel_update_events.get(guild_id)
+    if event is not None:
+        event.set()
+
+
+async def _panel_writer(guild_id: int) -> None:
+    """Single coalescing writer per guild: collapses bursts of update requests
+    into the latest desired state and paces edits to stay under Discord's
+    per-message PATCH bucket."""
+    event = panel_update_events.get(guild_id)
+    if event is None:
         return
+    last_fingerprint: tuple | None = None
     try:
-        new_panel = await channel.send(
-            embed=build_panel_embed(guild_id),
-            view=make_controls(guild_id),
-        )
-    except discord.DiscordException as repost_error:
-        print(f"[refresh_panel] repost failed: {type(repost_error).__name__}: {repost_error}")
+        while True:
+            await event.wait()
+            event.clear()
+            # Pace: hold off if we sent something very recently. New requests
+            # arriving during the sleep just re-set the event for the next loop.
+            now = time.monotonic()
+            since_last = now - panel_last_edit_at.get(guild_id, 0.0)
+            if since_last < PANEL_MIN_EDIT_INTERVAL:
+                await asyncio.sleep(PANEL_MIN_EDIT_INTERVAL - since_last)
+                event.clear()
+            message = now_playing_messages.get(guild_id)
+            if message is None:
+                continue
+            fingerprint = panel_fingerprint(guild_id)
+            if fingerprint == last_fingerprint:
+                continue
+            try:
+                await message.edit(
+                    content=None,
+                    embed=build_panel_embed(guild_id),
+                    view=make_controls(guild_id),
+                )
+                panel_last_edit_at[guild_id] = time.monotonic()
+                last_fingerprint = fingerprint
+            except discord.NotFound:
+                now_playing_messages.pop(guild_id, None)
+            except discord.HTTPException as edit_error:
+                # 401 (50027) means a webhook-message token expired — that
+                # message is permanently un-editable; drop it and stop retrying.
+                if edit_error.status == 401:
+                    print(f"[_panel_writer] panel token expired; dropping panel: {edit_error}")
+                    now_playing_messages.pop(guild_id, None)
+                else:
+                    print(f"[_panel_writer] edit failed: {type(edit_error).__name__}: {edit_error}")
+    except asyncio.CancelledError:
         return
-    now_playing_messages[guild_id] = new_panel
-    start_now_playing_ticker(guild_id, song, new_panel)
+    finally:
+        if panel_writer_tasks.get(guild_id) is asyncio.current_task():
+            panel_writer_tasks.pop(guild_id, None)
+            panel_update_events.pop(guild_id, None)
+
+
+def ensure_panel_writer(guild_id: int) -> None:
+    existing = panel_writer_tasks.get(guild_id)
+    if existing is not None and not existing.done():
+        return
+    panel_update_events[guild_id] = asyncio.Event()
+    panel_writer_tasks[guild_id] = asyncio.create_task(_panel_writer(guild_id))
+
+
+def stop_panel_writer(guild_id: int) -> None:
+    panel_update_events.pop(guild_id, None)
+    panel_last_edit_at.pop(guild_id, None)
+    task = panel_writer_tasks.pop(guild_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+async def refresh_panel(guild_id: int) -> None:
+    """Signal the writer to redraw the existing panel. Never posts a new one —
+    the panel is only ever created by the initial /play in queue_and_play."""
+    if now_playing_messages.get(guild_id) is None:
+        return
+    ensure_panel_writer(guild_id)
+    request_panel_update(guild_id)
 
 
 async def silent_ack(interaction: discord.Interaction) -> None:
@@ -218,21 +286,13 @@ async def silent_ack(interaction: discord.Interaction) -> None:
         pass
 
 
-async def _tick_now_playing(guild_id: int, song: dict, message) -> None:
-    last_fingerprint: tuple | None = None
+async def _tick_now_playing(guild_id: int, song: dict) -> None:
     try:
         while True:
             await asyncio.sleep(NOW_PLAYING_REFRESH_SECONDS)
             if currently_playing.get(guild_id) is not song:
                 return
-            fingerprint = panel_fingerprint(guild_id)
-            if fingerprint == last_fingerprint:
-                continue
-            try:
-                await message.edit(content=None, embed=build_panel_embed(guild_id))
-                last_fingerprint = fingerprint
-            except discord.DiscordException:
-                return
+            request_panel_update(guild_id)
     except asyncio.CancelledError:
         return
     finally:
@@ -240,11 +300,12 @@ async def _tick_now_playing(guild_id: int, song: dict, message) -> None:
             now_playing_tasks.pop(guild_id, None)
 
 
-def start_now_playing_ticker(guild_id: int, song: dict, message) -> None:
+def start_now_playing_ticker(guild_id: int, song: dict, message=None) -> None:
     existing = now_playing_tasks.get(guild_id)
     if existing is not None and not existing.done():
         existing.cancel()
-    now_playing_tasks[guild_id] = asyncio.create_task(_tick_now_playing(guild_id, song, message))
+    ensure_panel_writer(guild_id)
+    now_playing_tasks[guild_id] = asyncio.create_task(_tick_now_playing(guild_id, song))
 
 
 async def _auto_disconnect_after_inactivity(guild_id: int, seconds: int, bot: discord.Client) -> None:
@@ -275,6 +336,7 @@ async def _auto_disconnect_after_inactivity(guild_id: int, seconds: int, bot: di
         ticker = now_playing_tasks.pop(guild_id, None)
         if ticker is not None and not ticker.done():
             ticker.cancel()
+        stop_panel_writer(guild_id)
         panel = now_playing_messages.pop(guild_id, None)
         if panel is not None:
             try:
@@ -340,17 +402,16 @@ class QueuePlaySelect(discord.ui.Select):
         guild_id = interaction.guild.id
         target_id = self.values[0] if self.values else None
         idx = _find_by_queue_id(guild_id, target_id)
-        if idx is None or idx == 0:
+        try:
             await interaction.response.defer()
+        except discord.DiscordException:
+            pass
+        if idx is None or idx == 0:
             return
         queue = song_queues[guild_id]
         song = queue.pop(idx)
         queue.insert(0, song)
-        try:
-            await interaction.response.defer()
-            await interaction.edit_original_response(embed=build_panel_embed(guild_id), view=make_controls(guild_id))
-        except discord.DiscordException as play_select_error:
-            print(f"[QueuePlaySelect] failed: {type(play_select_error).__name__}: {play_select_error}")
+        request_panel_update(guild_id)
 
 
 class QueueRemoveSelect(discord.ui.Select):
@@ -378,15 +439,14 @@ class QueueRemoveSelect(discord.ui.Select):
         guild_id = interaction.guild.id
         target_id = self.values[0] if self.values else None
         idx = _find_by_queue_id(guild_id, target_id)
-        if idx is None:
-            await interaction.response.defer()
-            return
-        song_queues[guild_id].pop(idx)
         try:
             await interaction.response.defer()
-            await interaction.edit_original_response(embed=build_panel_embed(guild_id), view=make_controls(guild_id))
-        except discord.DiscordException as remove_select_error:
-            print(f"[QueueRemoveSelect] failed: {type(remove_select_error).__name__}: {remove_select_error}")
+        except discord.DiscordException:
+            pass
+        if idx is None:
+            return
+        song_queues[guild_id].pop(idx)
+        request_panel_update(guild_id)
 
 
 class SearchPickerSelect(discord.ui.Select):
@@ -494,22 +554,25 @@ class QueueControlsView(discord.ui.View):
         if voice_client is None:
             await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
             return
+        guild_id = interaction.guild.id
         if voice_client.is_playing():
             voice_client.pause()
-            song = currently_playing.get(interaction.guild.id)
+            song = currently_playing.get(guild_id)
             if song is not None and song.get("paused_at") is None:
                 song["paused_at"] = time.monotonic()
-            schedule_inactivity(interaction.guild.id, interaction.client, PAUSED_TIMEOUT_SECONDS)
+            schedule_inactivity(guild_id, interaction.client, PAUSED_TIMEOUT_SECONDS)
             await interaction.response.defer()
+            request_panel_update(guild_id)
             return
         if voice_client.is_paused():
             voice_client.resume()
-            song = currently_playing.get(interaction.guild.id)
+            song = currently_playing.get(guild_id)
             if song is not None and song.get("paused_at") is not None:
                 song["paused_total"] = song.get("paused_total", 0.0) + (time.monotonic() - song["paused_at"])
                 song["paused_at"] = None
-            cancel_inactivity(interaction.guild.id)
+            cancel_inactivity(guild_id)
             await interaction.response.defer()
+            request_panel_update(guild_id)
             return
         await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
 
@@ -528,28 +591,24 @@ class QueueControlsView(discord.ui.View):
         queue_expanded[guild_id] = not queue_expanded.get(guild_id, False)
         try:
             await interaction.response.defer()
-            await interaction.edit_original_response(
-                content=None, embed=build_panel_embed(guild_id), view=make_controls(guild_id)
-            )
-        except Exception as show_queue_error:
-            print(f"[show_queue] failed: {type(show_queue_error).__name__}: {show_queue_error}")
+        except discord.DiscordException:
+            pass
+        request_panel_update(guild_id)
 
     @discord.ui.button(label="Clear Queue", style=discord.ButtonStyle.danger, custom_id="qc:clear")
     async def clear_queue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         guild_id = interaction.guild.id
         pending_count = len(song_queues.get(guild_id, []))
-        song_queues[guild_id] = []
-        saved_queues.pop(guild_id, None)
         if pending_count == 0:
             await interaction.response.send_message("The queue is already empty.", ephemeral=True)
             return
+        song_queues[guild_id] = []
+        saved_queues.pop(guild_id, None)
         try:
             await interaction.response.defer()
-            await interaction.edit_original_response(
-                content=None, embed=build_panel_embed(guild_id), view=make_controls(guild_id)
-            )
-        except Exception as clear_queue_error:
-            print(f"[clear_queue] failed: {type(clear_queue_error).__name__}: {clear_queue_error}")
+        except discord.DiscordException:
+            pass
+        request_panel_update(guild_id)
 
     @discord.ui.button(label="Vol −10", style=discord.ButtonStyle.secondary, row=1, custom_id="qc:vol_down")
     async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -562,9 +621,9 @@ class QueueControlsView(discord.ui.View):
             voice_client.source.volume = new_level
         try:
             await interaction.response.defer()
-            await interaction.edit_original_response(view=make_controls(guild_id))
-        except discord.DiscordException as vol_error:
-            print(f"[vol_down] failed: {type(vol_error).__name__}: {vol_error}")
+        except discord.DiscordException:
+            pass
+        request_panel_update(guild_id)
 
     @discord.ui.button(label="100%", style=discord.ButtonStyle.secondary, disabled=True, row=1, custom_id="qc:vol_display")
     async def vol_display(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -581,9 +640,9 @@ class QueueControlsView(discord.ui.View):
             voice_client.source.volume = new_level
         try:
             await interaction.response.defer()
-            await interaction.edit_original_response(view=make_controls(guild_id))
-        except discord.DiscordException as vol_error:
-            print(f"[vol_up] failed: {type(vol_error).__name__}: {vol_error}")
+        except discord.DiscordException:
+            pass
+        request_panel_update(guild_id)
 
     @discord.ui.button(label="Seek", style=discord.ButtonStyle.primary, row=1, custom_id="qc:seek")
     async def seek_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
