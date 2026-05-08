@@ -38,13 +38,13 @@ class PlaylistsView(discord.ui.View):
         self.clear_items()
         names = playlists.names_for_guild(self.guild_id)
         if names:
-            self.add_item(_PlaylistSelect(parent=self, names=names))
+            self.add_item(_PlaylistSelect(parent_view=self, names=names))
         for button in self._build_action_buttons():
             self.add_item(button)
         if self.mode == _MODE_QUEUE_PICKER:
             queue = state.song_queues.get(self.guild_id, [])
             if queue:
-                self.add_item(_QueueSongPickerSelect(parent=self, queue=queue))
+                self.add_item(_QueueSongPickerSelect(parent_view=self, queue=queue))
 
     def _build_action_buttons(self) -> list[discord.ui.Button]:
         has_selection = self.selected is not None
@@ -134,7 +134,7 @@ class PlaylistsView(discord.ui.View):
     # ---- Action handlers -------------------------------------------------
 
     async def _on_create_clicked(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(_CreatePlaylistModal(parent=self))
+        await interaction.response.send_modal(_CreatePlaylistModal(parent_view=self))
 
     async def _on_load_clicked(self, interaction: discord.Interaction) -> None:
         # Lazy import: bot_helpers imports panel at module load.
@@ -219,12 +219,12 @@ class PlaylistsView(discord.ui.View):
 
 
 class _PlaylistSelect(discord.ui.Select):
-    def __init__(self, parent: PlaylistsView, names: list[str]) -> None:
+    def __init__(self, parent_view: PlaylistsView, names: list[str]) -> None:
         options = [
             discord.SelectOption(
                 label=name[:95],
                 value=name[:100],
-                default=(name == parent.selected),
+                default=(name == parent_view.selected),
             )
             for name in names[:25]
         ]
@@ -235,14 +235,14 @@ class _PlaylistSelect(discord.ui.Select):
             max_values=1,
             row=0,
         )
-        self.parent = parent
+        self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await self.parent.select_playlist(interaction, self.values[0])
+        await self.parent_view.select_playlist(interaction, self.values[0])
 
 
 class _QueueSongPickerSelect(discord.ui.Select):
-    def __init__(self, parent: PlaylistsView, queue: list[dict]) -> None:
+    def __init__(self, parent_view: PlaylistsView, queue: list[dict]) -> None:
         options: list[discord.SelectOption] = []
         for index, song in enumerate(queue[:25], start=1):
             qid = song.get("queue_id")
@@ -265,10 +265,10 @@ class _QueueSongPickerSelect(discord.ui.Select):
             max_values=1,
             row=2,
         )
-        self.parent = parent
+        self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await self.parent.add_queued_song(interaction, self.values[0])
+        await self.parent_view.add_queued_song(interaction, self.values[0])
 
 
 class _CreatePlaylistModal(discord.ui.Modal, title="New playlist"):
@@ -280,15 +280,15 @@ class _CreatePlaylistModal(discord.ui.Modal, title="New playlist"):
         required=True,
     )
 
-    def __init__(self, parent: PlaylistsView) -> None:
+    def __init__(self, parent_view: PlaylistsView) -> None:
         super().__init__()
-        self.parent = parent
+        self.parent_view = parent_view
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         success, message = playlists.create_playlist(
-            self.parent.guild_id, self.name.value, self.parent.user_name
+            self.parent_view.guild_id, self.name.value, self.parent_view.user_name
         )
         if success:
-            self.parent.selected = self.name.value.strip()[:32]
-        self.parent.mode = _MODE_MAIN
-        await self.parent._update(interaction, status=message)
+            self.parent_view.selected = self.name.value.strip()[:32]
+        self.parent_view.mode = _MODE_MAIN
+        await self.parent_view._update(interaction, status=message)
