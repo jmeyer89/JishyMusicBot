@@ -28,6 +28,7 @@ from state import (
 from panel.render import format_time, parse_time
 from panel.writer import request_panel_update
 from panel.lifecycle import cancel_inactivity, schedule_inactivity
+from panel.playlists_view import PlaylistsView
 
 
 def _find_by_queue_id(guild_id: int, queue_id: str | None) -> int | None:
@@ -310,6 +311,13 @@ class QueueControlsView(discord.ui.View):
     @discord.ui.button(label="Seek", style=discord.ButtonStyle.primary, row=1, custom_id="qc:seek")
     async def seek_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(SeekModal())
+
+    @discord.ui.button(label="Playlists", style=discord.ButtonStyle.secondary, row=1, custom_id="qc:playlists")
+    async def playlists_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        view = PlaylistsView(interaction.guild.id, interaction.user.display_name)
+        await interaction.response.send_message(
+            content=view.content(), view=view, ephemeral=True
+        )
 
     async def _apply_volume_delta(self, interaction: discord.Interaction, delta: float) -> None:
         guild_id = interaction.guild.id
