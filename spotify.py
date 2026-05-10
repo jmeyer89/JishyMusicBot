@@ -5,7 +5,12 @@ import time
 
 import requests
 
-from config import MAX_QUEUE_LENGTH, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET
+from config import (
+    MAX_QUEUE_LENGTH,
+    SPOTIFY_CLIENT_ID,
+    SPOTIFY_CLIENT_SECRET,
+    SPOTIFY_REFRESH_TOKEN,
+)
 
 
 API_BASE = "https://api.spotify.com/v1"
@@ -38,16 +43,38 @@ def parse_spotify_url(query: str) -> tuple[str, str] | None:
     return kind, spotify_id
 
 
-def _fetch_client_credentials_token() -> dict:
-    auth_header = base64.b64encode(
+def _basic_auth_header() -> str:
+    return base64.b64encode(
         f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()
     ).decode()
+
+
+def _fetch_client_credentials_token() -> dict:
     response = requests.post(
         TOKEN_URL,
-        headers={"Authorization": f"Basic {auth_header}"},
+        headers={"Authorization": f"Basic {_basic_auth_header()}"},
         data={"grant_type": "client_credentials"},
         timeout=10,
     )
+    response.raise_for_status()
+    return response.json()
+
+
+def _fetch_refresh_token_grant() -> dict:
+    response = requests.post(
+        TOKEN_URL,
+        headers={"Authorization": f"Basic {_basic_auth_header()}"},
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": SPOTIFY_REFRESH_TOKEN,
+        },
+        timeout=10,
+    )
+    if response.status_code in (400, 401):
+        raise SpotifyError(
+            "Spotify refresh token rejected. Re-run `python spotify_auth.py` "
+            "(after clearing SPOTIFY_REFRESH_TOKEN in .env) to authorize again."
+        )
     response.raise_for_status()
     return response.json()
 
@@ -63,8 +90,15 @@ async def _get_access_token() -> str:
                 "SPOTIFY_CLIENT_SECRET to your .env file."
             )
         loop = asyncio.get_running_loop()
+        # Refresh-token grant unlocks playlist access; fall back to client
+        # credentials when no refresh token is configured (still works for
+        # tracks, albums, and free-text search).
+        fetcher = (
+            _fetch_refresh_token_grant if SPOTIFY_REFRESH_TOKEN
+            else _fetch_client_credentials_token
+        )
         try:
-            data = await loop.run_in_executor(None, _fetch_client_credentials_token)
+            data = await loop.run_in_executor(None, fetcher)
         except requests.RequestException as exc:
             raise SpotifyError(f"Could not get Spotify access token: {exc}") from exc
         _access_token = data["access_token"]
@@ -85,6 +119,14 @@ async def _get_json(url: str, params: dict | None = None) -> dict:
         raise SpotifyError(f"Spotify request failed: {exc}") from exc
     if not response.ok:
         message = _extract_error_message(response) or response.reason or "Spotify request failed."
+        if response.status_code == 403:
+            # Spotify gates playlist track access for apps without extended
+            # access mode regardless of OAuth scopes — verified empirically.
+            message += (
+                " — Spotify restricts playlist track access for this app's "
+                "tier. Use a track or album link instead, or apply for "
+                "extended access mode in the Spotify Developer Dashboard."
+            )
         raise SpotifyError(message)
     try:
         return response.json()

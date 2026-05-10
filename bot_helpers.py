@@ -64,6 +64,13 @@ async def resolve_query(query: str) -> tuple[list[dict], list[dict] | None]:
     extractors for unexpected failures — callers should catch both.
     """
     if spotify.is_spotify_url(query):
+        parsed = spotify.parse_spotify_url(query)
+        if parsed and parsed[0] == "playlist":
+            raise QueryResolutionError(
+                "Spotify playlist links don't work with this bot's API tier "
+                "(extended access required). Use a track or album link, or "
+                "share specific track URLs instead."
+            )
         songs = await spotify.extract_spotify_tracks(query)
         if not songs:
             raise QueryResolutionError("That Spotify link is empty or unavailable.")

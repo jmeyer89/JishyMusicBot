@@ -18,6 +18,8 @@ ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 SCOPES = [
+    "playlist-read-private",
+    "playlist-read-collaborative",
     "user-read-playback-state",
     "user-modify-playback-state",
     "user-read-currently-playing",
