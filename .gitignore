@@ -24,5 +24,6 @@ Thumbs.db
 
 *.log
 bot_config.json
+saved_queues.json
 youtube_cookies.txt
 cookies.txt
