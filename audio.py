@@ -38,23 +38,32 @@ YTDL_SEARCH_OPTIONS = {
     "extract_flat": "in_playlist",
 }
 
-# Title substrings that mark a result as a video upload rather than the audio
-# track. Each hit adds to a candidate's penalty; lowest score wins.
-VIDEO_DOWNRANK_KEYWORDS = (
-    "music video",
-    "official video",
-    "official music video",
-    "lyric video",
-    "lyrics video",
-    "(mv)",
-    "[mv]",
-    " mv ",
-    "live performance",
-    "live at ",
-    "behind the scenes",
-    "video edit",
-    "fan made",
+# Hard downranks: titles signaling a different version of the song
+# (remixes, covers, alternate edits, commentary, live cuts).
+ALT_VERSION_KEYWORDS = (
+    "remix", "mashup", "bootleg", "rework",
+    "sped up", "speed up", "slowed", "nightcore", "8d audio",
+    "cover by", "guitar cover", "drum cover", "piano cover", "vocal cover",
+    "karaoke", "instrumental",
+    "reaction", "review", "tutorial", "lesson", "how to play",
+    "live performance", "live at ", "live from ",
+    "(live)", "[live]",
+    "behind the scenes", "fan made", "fan-made",
 )
+
+# Soft downranks: video uploads of the canonical audio. Same song, but a
+# `<artist> - Topic` / official-audio upload is usually preferable.
+VIDEO_UPLOAD_KEYWORDS = (
+    "music video", "official video", "official music video",
+    "lyric video", "lyrics video",
+    "(mv)", "[mv]", " mv ",
+    "video edit",
+)
+
+# Past this gap, treat the candidate as a different cut (extended/remix/
+# slowed) and push it below every in-tolerance match.
+DURATION_MATCH_TOLERANCE_SECONDS = 25
+DURATION_MATCH_TOLERANCE_FRACTION = 0.15
 
 SEARCH_CANDIDATES = 5
 
@@ -78,17 +87,34 @@ def _extract(options: dict, query: str) -> dict:
         return ytdl.extract_info(query, download=False)
 
 
-def _rerank_score(entry: dict, expected_duration: float | None) -> tuple[int, float]:
-    """Lower is better. First component counts video-keyword hits in the title;
-    second is how far the candidate's duration is from the expected one (used
-    as a tiebreaker — only applied when we have a target duration)."""
+def _rerank_score(entry: dict, expected_duration: float | None) -> tuple[int, int, float]:
+    """Lower is better. Components in priority order:
+    1. wrong_version: 1 when expected_duration is given and this candidate's
+       duration is far off — pushes alt cuts below same-length matches even
+       if the title looks cleaner.
+    2. keyword_score: alt-version keywords weighted heavy, video-upload
+       keywords light; `<artist> - Topic` channel uploads earn a bonus.
+    3. duration_diff: tiebreaker between candidates with the same keyword
+       score (only meaningful when expected_duration is given)."""
     title_lower = (entry.get("title") or "").lower()
-    keyword_hits = sum(1 for kw in VIDEO_DOWNRANK_KEYWORDS if kw in title_lower)
+    alt_hits = sum(1 for kw in ALT_VERSION_KEYWORDS if kw in title_lower)
+    video_hits = sum(1 for kw in VIDEO_UPLOAD_KEYWORDS if kw in title_lower)
+    uploader = (entry.get("uploader") or entry.get("channel") or "").lower()
+    topic_bonus = 3 if uploader.endswith(" - topic") else 0
+    keyword_score = alt_hits * 4 + video_hits - topic_bonus
+
     duration_diff = 0.0
+    wrong_version = 0
     candidate_duration = entry.get("duration")
     if expected_duration and candidate_duration:
         duration_diff = abs(candidate_duration - expected_duration)
-    return (keyword_hits, duration_diff)
+        tolerance = max(
+            DURATION_MATCH_TOLERANCE_SECONDS,
+            expected_duration * DURATION_MATCH_TOLERANCE_FRACTION,
+        )
+        if duration_diff > tolerance:
+            wrong_version = 1
+    return (wrong_version, keyword_score, duration_diff)
 
 
 def _entry_to_song(data: dict, fallback_url: str) -> dict:
@@ -120,19 +146,29 @@ async def extract_song_info(query: str, expected_duration: float | None = None) 
     candidates = [entry for entry in (flat.get("entries") or []) if entry]
     if not candidates:
         raise RuntimeError(f"No YouTube results for: {query}")
-    best = min(candidates, key=lambda e: _rerank_score(e, expected_duration))
-    chosen_url = best.get("webpage_url") or best.get("url")
-    if not chosen_url:
-        video_id = best.get("id")
-        if video_id:
-            chosen_url = f"https://www.youtube.com/watch?v={video_id}"
-    if not chosen_url:
-        raise RuntimeError("Top YouTube candidate had no usable URL.")
-    data = await asyncio.wait_for(
-        loop.run_in_executor(None, _extract, YTDL_FORMAT_OPTIONS, chosen_url),
-        timeout=EXTRACTION_TIMEOUT_SECONDS,
-    )
-    return _entry_to_song(data, chosen_url)
+    ranked = sorted(candidates, key=lambda e: _rerank_score(e, expected_duration))
+    last_error: Exception | None = None
+    for candidate in ranked:
+        chosen_url = candidate.get("webpage_url") or candidate.get("url")
+        if not chosen_url:
+            video_id = candidate.get("id")
+            if video_id:
+                chosen_url = f"https://www.youtube.com/watch?v={video_id}"
+        if not chosen_url:
+            continue
+        try:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(None, _extract, YTDL_FORMAT_OPTIONS, chosen_url),
+                timeout=EXTRACTION_TIMEOUT_SECONDS,
+            )
+        except Exception as candidate_error:
+            last_error = candidate_error
+            print(f"[audio] candidate failed for '{query}' ({type(candidate_error).__name__}: {candidate_error}); trying next")
+            continue
+        return _entry_to_song(data, chosen_url)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"No usable YouTube candidate for: {query}")
 
 
 async def extract_playlist_info(query: str) -> list[dict]:
