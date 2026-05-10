@@ -198,16 +198,10 @@ class SeekModal(discord.ui.Modal, title="Seek"):
             await interaction.response.defer()
             return
         seek_seconds = max(0, seconds)
-        new_entry = {
-            "title": song.get("title"),
-            "url": None,
-            "webpage_url": song.get("webpage_url"),
-            "duration": song.get("duration"),
-            "thumbnail": song.get("thumbnail"),
-            "requester": song.get("requester"),
-            "seek_to": float(seek_seconds),
-            "queue_id": uuid.uuid4().hex,
-        }
+        new_entry = dict(song)
+        new_entry["url"] = None
+        new_entry["seek_to"] = float(seek_seconds)
+        new_entry["queue_id"] = uuid.uuid4().hex
         song_queues.setdefault(guild_id, []).insert(0, new_entry)
         if voice_client.is_playing() or voice_client.is_paused():
             voice_client.stop()
